@@ -554,8 +554,34 @@ do_push() {
   push_file_progress "$TAR_FILE" "$SERVER_PATH/"
   step_ok "Docker image tar uploaded"
 
+
+ step_start "Generating production docker-compose.yml..."
+  PROD_COMPOSE=$(mktemp /tmp/docker-compose-prod-XXXX.yml)
+  cat > "$PROD_COMPOSE" << COMPOSEFILE
+services:
+  app:
+    image: ${IMAGE_NAME}:latest
+    ports:
+      - "${APP_PORT}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').request({ hostname: '0.0.0.0', port: 3000, path: '/api/health', timeout: 2000 }, (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1)).end()"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 5s
+COMPOSEFILE
+  step_ok "Production docker-compose.yml generated"
+
   step_start "Uploading docker-compose.yml..."
-  push_file_progress "docker-compose.yml" "$SERVER_PATH/"
+  push_file_progress "$PROD_COMPOSE" "$SERVER_PATH/docker-compose.yml"
+  rm -f "$PROD_COMPOSE"
   step_ok "docker-compose.yml uploaded"
 
   step_start "Uploading .env${DEPLOY_CLIENT:+ (for $DEPLOY_CLIENT)}..."
