@@ -25,7 +25,6 @@ source "$CONFIG_FILE"
 
 # ── Load secrets from Keychain ────────────────────────────────────────────────
 SERVER_PASS=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
-DATABASE_URL=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-dburl" -w 2>/dev/null || echo "")
 
 if [ -z "$SERVER_PASS" ]; then
   echo "❌ Server password not found in Keychain."
@@ -33,10 +32,36 @@ if [ -z "$SERVER_PASS" ]; then
   exit 1
 fi
 
-if [ -z "$DATABASE_URL" ]; then
-  echo "❌ Database URL not found in Keychain."
-  echo "   Run: setup-deploy --update-secrets"
-  exit 1
+# ── Load DB URLs from Keychain (multi-client support) ─────────────────────────
+DATABASE_URL=""
+if [ -n "$DB_CLIENTS" ]; then
+  for db_client in $DB_CLIENTS; do
+    db_url=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-db-${db_client}-url" -w 2>/dev/null || echo "")
+    if [ -z "$db_url" ]; then
+      echo "❌ Database URL for client '$db_client' not found in Keychain."
+      echo "   Run: setup-deploy --update-secrets"
+      exit 1
+    fi
+    eval "DB_URL_${db_client}=\"$db_url\""
+    # Use first client as default DATABASE_URL
+    if [ -z "$DATABASE_URL" ]; then
+      DATABASE_URL="$db_url"
+    fi
+    # Load client ID if applicable
+    has_id_var="DB_${db_client}_HAS_CLIENT_ID"
+    if [ "${!has_id_var}" = "true" ]; then
+      client_id=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-db-${db_client}-clientid" -w 2>/dev/null || echo "")
+      eval "DB_CLIENT_ID_${db_client}=\"$client_id\""
+    fi
+  done
+else
+  # Legacy single DB support
+  DATABASE_URL=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-dburl" -w 2>/dev/null || echo "")
+  if [ -z "$DATABASE_URL" ]; then
+    echo "❌ Database URL not found in Keychain."
+    echo "   Run: setup-deploy --update-secrets"
+    exit 1
+  fi
 fi
 
 CMD="${1:-build}"
