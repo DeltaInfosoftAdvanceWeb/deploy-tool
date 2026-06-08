@@ -43,16 +43,16 @@ ask() {
   local value=""
   while [ -z "$value" ]; do
     if [ -n "$default" ]; then
-      printf "${CYAN}  ? ${BOLD}%s${NC}${DIM} [%s]${NC}: " "$prompt" "$default"
+      printf "  ? %s [%s]: " "$prompt" "$default" >&2
     else
-      printf "${CYAN}  ? ${BOLD}%s${NC}: " "$prompt"
+      printf "  ? %s: " "$prompt" >&2
     fi
-    read value </dev/tty
+    read value
     if [ -z "$value" ] && [ -n "$default" ]; then
       value="$default"
     fi
     if [ -z "$value" ]; then
-      warn "This field is required."
+      echo "  ⚠️  This field is required." >&2
     fi
   done
   echo "$value"
@@ -62,11 +62,11 @@ ask_secret() {
   local prompt="$1"
   local value=""
   while [ -z "$value" ]; do
-    printf "${CYAN}  ? ${BOLD}%s${NC}${DIM} (hidden)${NC}: " "$prompt"
-    read -s value </dev/tty
-    echo ""
+    printf "  ? %s (hidden): " "$prompt" >&2
+    read -s value
+    echo "" >&2
     if [ -z "$value" ]; then
-      warn "This field is required."
+      echo "  ⚠️  This field is required." >&2
     fi
   done
   echo "$value"
@@ -218,8 +218,8 @@ do_setup() {
   # Check we are in a Next.js project
   if [ ! -f "package.json" ]; then
     warn "No package.json found. Are you in a Next.js project folder?"
-    printf "  Continue anyway? (y/N): "
-    read confirm </dev/tty
+    printf "  Continue anyway? (y/N): " >&2
+    read confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
       echo "  Aborted."
       exit 0
