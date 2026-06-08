@@ -130,7 +130,7 @@ push_file_progress() {
   if command -v rsync &>/dev/null; then
     info "Using rsync (with live progress)..."
     if command -v sshpass &>/dev/null && [ -n "$SERVER_PASS" ]; then
-      sshpass -p "$SERVER_PASS" rsync -avz --progress \
+      sshpass -p "$SERVER_PASS" rsync -avz --checksum --progress \
         -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
         "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
         step_err "Failed to transfer $filename"
@@ -138,7 +138,7 @@ push_file_progress() {
         exit 1
       }
     else
-      rsync -avz --progress \
+      rsync -avz --checksum --progress \
         -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
         "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
         step_err "Failed to transfer $filename"
