@@ -1,13 +1,12 @@
 #!/bin/bash
 # ── setup-deploy ──────────────────────────────────────────────────────────────
-# Version: 2.2.0
+# Version: 2.3.0
 # Usage:
 #   setup-deploy                  → setup new project
 #   setup-deploy --install        → first time install on this Mac
 #   setup-deploy --update         → update deploy engine from GitHub
 #   setup-deploy --update-secrets → update server password in Keychain
-#   setup-deploy --fix            → auto-fix image name mismatch between
-#                                   deploy.config.sh and docker-compose.yml
+#   setup-deploy --fix            → add image: line to docker-compose.yml if missing
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # IMPORTANT — why this file uses a main() wrapper:
@@ -20,7 +19,7 @@
 
 main() {
 
-DEPLOY_VERSION="2.2.0"
+DEPLOY_VERSION="2.3.0"
 GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
 DEPLOY_DIR="$HOME/.deploy"
 
@@ -285,7 +284,7 @@ do_setup() {
   while true; do
 
     # ── Step 1: App Name ──────────────────────────────────────────────────────
-    section "Step 1 of 8 — App Name"
+    section "Step 1 of 7 — App Name"
     info "Label to identify your app (e.g. CostMetrix, DeltaAuth)"
     while true; do
       APP_NAME=$(ask "App name")
@@ -298,21 +297,8 @@ do_setup() {
     APP_NAME_LOWER=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
     printf "\n"
 
-    # ── Step 2: Docker Image Name ─────────────────────────────────────────────
-    section "Step 2 of 8 — Docker Image Name"
-    info "Name for the Docker image (lowercase only)"
-    while true; do
-      IMAGE_NAME=$(ask "Docker image name" "${APP_NAME_LOWER}-app")
-      if echo "$IMAGE_NAME" | grep -qE '^[a-z0-9_-]+$'; then break
-      else
-        err "Must be lowercase with no spaces." >&2
-        hint "Example: myapp-app, delta-auth-app" >&2
-      fi
-    done
-    printf "\n"
-
-    # ── Step 3: Tar File Name ─────────────────────────────────────────────────
-    section "Step 3 of 8 — Tar File Name"
+    # ── Step 2: Tar File Name ─────────────────────────────────────────────────
+    section "Step 2 of 7 — Tar File Name"
     info "Name for the exported Docker archive"
     while true; do
       TAR_FILE=$(ask "Tar file name" "${APP_NAME_LOWER}.tar")
@@ -324,8 +310,8 @@ do_setup() {
     done
     printf "\n"
 
-    # ── Step 4: Server IP ─────────────────────────────────────────────────────
-    section "Step 4 of 8 — Server IP Address"
+    # ── Step 3: Server IP ─────────────────────────────────────────────────────
+    section "Step 3 of 7 — Server IP Address"
     info "IP address of your Linux deployment server"
     while true; do
       SERVER_IP=$(ask "Server IP address (e.g. 192.168.1.249)")
@@ -337,8 +323,8 @@ do_setup() {
     done
     printf "\n"
 
-    # ── Step 5: Server User ───────────────────────────────────────────────────
-    section "Step 5 of 8 — Server SSH Username"
+    # ── Step 4: Server User ───────────────────────────────────────────────────
+    section "Step 4 of 7 — Server SSH Username"
     info "Username to SSH into your server"
     while true; do
       SERVER_USER=$(ask "Server SSH username" "devadmin")
@@ -350,8 +336,8 @@ do_setup() {
     done
     printf "\n"
 
-    # ── Step 6: App Port ──────────────────────────────────────────────────────
-    section "Step 6 of 8 — App Port"
+    # ── Step 5: App Port ──────────────────────────────────────────────────────
+    section "Step 5 of 7 — App Port"
     info "Port your app will run on"
     while true; do
       APP_PORT=$(ask_number "App port" "3000" "1" "65535")
@@ -359,14 +345,14 @@ do_setup() {
     done
     printf "\n"
 
-    # ── Step 7: Server Path ───────────────────────────────────────────────────
-    section "Step 7 of 8 — Server Folder Path"
+    # ── Step 6: Server Path ───────────────────────────────────────────────────
+    section "Step 6 of 7 — Server Folder Path"
     info "Folder on the server where app files will be uploaded"
     SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
     printf "\n"
 
-    # ── Step 8: API Clients (optional) ────────────────────────────────────────
-    section "Step 8 of 8 — API Clients (optional)"
+    # ── Step 7: API Clients (optional) ────────────────────────────────────────
+    section "Step 7 of 7 — API Clients (optional)"
     info "If your app deploys to multiple clients with different API URLs, add them here."
     info "If not applicable (e.g. CostMetrix), enter 0 to skip."
     printf "\n"
@@ -438,7 +424,6 @@ do_setup() {
     printf "${BOLD}${MAGENTA}  Review Your Configuration${NC}\n"
     printf "${BOLD}${MAGENTA}══════════════════════════════════════════${NC}\n\n"
     printf "  ${BOLD}App name      :${NC} %s\n" "$APP_NAME"
-    printf "  ${BOLD}Docker image  :${NC} %s\n" "$IMAGE_NAME"
     printf "  ${BOLD}Tar file      :${NC} %s\n" "$TAR_FILE"
     printf "  ${BOLD}Server IP     :${NC} %s\n" "$SERVER_IP"
     printf "  ${BOLD}SSH username  :${NC} %s\n" "$SERVER_USER"
@@ -474,9 +459,8 @@ do_setup() {
     printf "# ── Deploy Configuration ────────────────────────────────────────────────────\n"
     printf "# Generated by setup-deploy v%s\n" "$DEPLOY_VERSION"
     printf "# Server password stored in macOS Keychain — NOT here\n"
-    printf "# API client URLs are stored here (not secrets)\n\n"
+    printf "# IMAGE_NAME is read from docker-compose.yml at deploy time — not stored here\n\n"
     printf "APP_NAME=\"%s\"\n" "$APP_NAME"
-    printf "IMAGE_NAME=\"%s\"\n" "$IMAGE_NAME"
     printf "TAR_FILE=\"%s\"\n" "$TAR_FILE"
     printf "SERVER_IP=\"%s\"\n" "$SERVER_IP"
     printf "SERVER_USER=\"%s\"\n" "$SERVER_USER"
@@ -551,119 +535,53 @@ do_fix() {
 
   source "deploy.config.sh"
 
-  # ── Extract image name from docker-compose.yml ────────────────────────────
-  # Matches lines like:  image: myapp  or  image: myapp:latest  (with any indent)
-  COMPOSE_IMAGE=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'" )
+  # ── Check if image: line already exists ───────────────────────────────────
+  COMPOSE_IMAGE=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 \
+    | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'")
 
-  # ── Case 1: no image: line at all (e.g. dev compose using build:) ─────────
-  if [ -z "$COMPOSE_IMAGE" ]; then
-    printf "  ${YELLOW}No 'image:' line found in docker-compose.yml${NC}\n\n"
-    printf "  The deploy tool needs an ${BOLD}image:${NC} line in your service so it can\n"
-    printf "  run the pre-built image instead of building from source on the server.\n\n"
-    printf "  IMAGE_NAME in deploy.config.sh: ${BOLD}${GREEN}%s${NC}\n\n" "$IMAGE_NAME"
-    printf "  Add   ${CYAN}image: %s${NC}   to your service in docker-compose.yml? (Y/n): " "$IMAGE_NAME" >&2
-    read add_confirm
-    add_confirm="${add_confirm:-y}"
-    if [ "$add_confirm" = "n" ] || [ "$add_confirm" = "N" ]; then
-      printf "  Aborted. Add the image: line manually and run again.\n\n"
-      exit 0
+  if [ -n "$COMPOSE_IMAGE" ]; then
+    success "docker-compose.yml already has:  image: $COMPOSE_IMAGE"
+    printf "  ${DIM}The deploy engine will use this image name automatically.${NC}\n\n"
+    exit 0
+  fi
+
+  # ── No image: line — ask what name to use and insert it ───────────────────
+  printf "  ${YELLOW}No 'image:' line found in docker-compose.yml${NC}\n\n"
+  printf "  The deploy engine reads the image name directly from docker-compose.yml.\n"
+  printf "  You need to add an ${BOLD}image:${NC} line to your service.\n\n"
+
+  while true; do
+    printf "  ? Image name to use (lowercase, e.g. auth, myapp): " >&2
+    read NEW_IMAGE
+    if echo "$NEW_IMAGE" | grep -qE '^[a-z0-9_-]+$'; then break
+    else err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
     fi
+  done
 
-    # Find the first service block's first key (build:, command:, ports:, etc.)
-    # and insert image: above it, indented to match
-    local _tmp
-    _tmp=$(mktemp)
-    # Use awk: after we see a line matching "^\s+build:|command:|ports:|volumes:|env"
-    # inside a services block, insert image: once before the first such line
-    awk -v img="$IMAGE_NAME" '
-      /^services:/ { in_services=1 }
-      in_services && !inserted && /^[[:space:]]+(build|command|ports|volumes|environment|env_file|healthcheck)[[:space:]]*:/ {
-        # Capture the indentation of this line
-        match($0, /^[[:space:]]+/)
-        indent = substr($0, 1, RLENGTH)
-        print indent "image: " img
-        inserted=1
-      }
-      { print }
-    ' docker-compose.yml > "$_tmp"
+  local _tmp
+  _tmp=$(mktemp)
+  awk -v img="$NEW_IMAGE" '
+    /^services:/ { in_services=1 }
+    in_services && !inserted && /^[[:space:]]+(build|command|ports|volumes|environment|env_file|healthcheck)[[:space:]]*:/ {
+      match($0, /^[[:space:]]+/)
+      indent = substr($0, 1, RLENGTH)
+      print indent "image: " img
+      inserted=1
+    }
+    { print }
+  ' docker-compose.yml > "$_tmp"
 
-    if grep -q "image: $IMAGE_NAME" "$_tmp"; then
-      mv "$_tmp" docker-compose.yml
-      success "docker-compose.yml updated — added:  image: $IMAGE_NAME"
-    else
-      rm -f "$_tmp"
-      err "Could not auto-insert image: line. Please add it manually:"
-      printf "\n  services:\n    app:\n      image: %s\n      ...\n\n" "$IMAGE_NAME"
-      exit 1
-    fi
-
+  if grep -q "image: $NEW_IMAGE" "$_tmp"; then
+    mv "$_tmp" docker-compose.yml
     printf "\n"
-    success "Fix applied! docker-compose.yml now has:  image: $IMAGE_NAME"
+    success "docker-compose.yml updated — added:  image: $NEW_IMAGE"
     printf "\n  Run:  ${CYAN}./deploy.sh push${NC}  to deploy.\n\n"
-    exit 0
-  fi
-
-  # ── Case 2: image: line exists but matches — nothing to do ────────────────
-  if [ "$IMAGE_NAME" = "$COMPOSE_IMAGE" ]; then
-    success "No mismatch — IMAGE_NAME ('$IMAGE_NAME') already matches docker-compose.yml"
-    printf "\n"
-    exit 0
-  fi
-
-  # ── Case 3: image: line exists but doesn't match ──────────────────────────
-  printf "  ${YELLOW}Mismatch detected:${NC}\n\n"
-  printf "  ${BOLD}deploy.config.sh  IMAGE_NAME${NC} = ${RED}%s${NC}\n" "$IMAGE_NAME"
-  printf "  ${BOLD}docker-compose.yml image:   ${NC} = ${RED}%s${NC}\n\n" "$COMPOSE_IMAGE"
-
-  printf "  Which value is correct?\n\n"
-  printf "  ${BOLD}1.${NC} Use ${GREEN}%-30s${NC} ${DIM}(update docker-compose.yml to match config)${NC}\n" "$IMAGE_NAME"
-  printf "  ${BOLD}2.${NC} Use ${GREEN}%-30s${NC} ${DIM}(update deploy.config.sh to match compose)${NC}\n" "$COMPOSE_IMAGE"
-  printf "  ${BOLD}3.${NC} Enter a new name manually\n\n"
-  printf "  ? Choice [1]: " >&2
-  read fix_choice
-  fix_choice="${fix_choice:-1}"
-
-  case "$fix_choice" in
-    1) CORRECT_NAME="$IMAGE_NAME" ;;
-    2) CORRECT_NAME="$COMPOSE_IMAGE" ;;
-    3)
-      while true; do
-        printf "  ? New image name (lowercase, no spaces): " >&2
-        read CORRECT_NAME
-        if echo "$CORRECT_NAME" | grep -qE '^[a-z0-9_-]+$'; then break
-        else err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
-        fi
-      done
-      ;;
-    *)
-      err "Invalid choice. Run setup-deploy --fix again."
-      exit 1
-      ;;
-  esac
-
-  printf "\n"
-  info "Applying fix: image name = '$CORRECT_NAME'"
-  printf "\n"
-
-  if [ "$IMAGE_NAME" != "$CORRECT_NAME" ]; then
-    sed -i.bak "s|^IMAGE_NAME=.*|IMAGE_NAME=\"${CORRECT_NAME}\"|" deploy.config.sh
-    rm -f deploy.config.sh.bak
-    success "deploy.config.sh updated  (IMAGE_NAME=\"$CORRECT_NAME\")"
   else
-    info "deploy.config.sh already correct — no change"
+    rm -f "$_tmp"
+    err "Could not auto-insert image: line. Add it manually:"
+    printf "\n  services:\n    app:\n      image: %s\n\n" "$NEW_IMAGE"
+    exit 1
   fi
-
-  if [ "$COMPOSE_IMAGE" != "$CORRECT_NAME" ]; then
-    sed -i.bak "s|^\(\s*image\s*:\s*\)${COMPOSE_IMAGE}|\1${CORRECT_NAME}|g" docker-compose.yml
-    rm -f docker-compose.yml.bak
-    success "docker-compose.yml updated (image: $CORRECT_NAME)"
-  else
-    info "docker-compose.yml already correct — no change"
-  fi
-
-  printf "\n"
-  success "Fix applied! Both files now use image name: '$CORRECT_NAME'"
-  printf "\n  Run:  ${CYAN}./deploy.sh push${NC}  to deploy.\n\n"
 }
 
 # ── Router ────────────────────────────────────────────────────────────────────

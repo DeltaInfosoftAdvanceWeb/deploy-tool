@@ -70,6 +70,20 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 source "$CONFIG_FILE"
 
+# ── Read IMAGE_NAME from docker-compose.yml (single source of truth) ─────────
+# IMAGE_NAME is intentionally NOT stored in deploy.config.sh to prevent
+# the two files from drifting out of sync.
+if [ -f "docker-compose.yml" ]; then
+  IMAGE_NAME=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 \
+    | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'")
+fi
+if [ -z "$IMAGE_NAME" ]; then
+  printf "${RED}❌ No 'image:' line found in docker-compose.yml.${NC}\n"
+  printf "   Add one to your service, e.g.:  image: myapp\n"
+  printf "   Or run: setup-deploy --fix\n"
+  exit 1
+fi
+
 # ── Load server password from Keychain ───────────────────────────────────────
 SERVER_PASS=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
 if [ -z "$SERVER_PASS" ]; then
@@ -174,22 +188,11 @@ check_ssh() {
   fi
 }
 
-# ── Validate docker-compose.yml has correct image name ───────────────────────
-check_compose_image() {
-  if [ ! -f "docker-compose.yml" ]; then
-    step_err "docker-compose.yml not found in current directory"
-    printf "   Make sure docker-compose.yml exists in your project root\n"
-    exit 1
-  fi
-  if ! grep -q "$IMAGE_NAME" docker-compose.yml; then
-    step_err "Image name '$IMAGE_NAME' not found in docker-compose.yml"
-    printf "   Auto-fix:  setup-deploy --fix\n"
-    printf "   Or manually ensure docker-compose.yml contains:  image: %s\n" "$IMAGE_NAME"
-    exit 1
-  fi
+# ── Validate docker-compose.yml has a ports: mapping ─────────────────────────
+check_compose_ports() {
   if ! grep -qE 'ports:' docker-compose.yml; then
     step_warn "No 'ports:' section found in docker-compose.yml"
-    printf "   Without a ports mapping, the app will not be accessible from outside the container.\n"
+    printf "   Without a ports mapping the app will not be accessible.\n"
     printf "   Expected something like:\n"
     printf "       ports:\n"
     printf "         - \"%s:3000\"\n" "$APP_PORT"
@@ -515,8 +518,8 @@ do_push() {
 
   print_header "Push to $SERVER_IP${DEPLOY_CLIENT:+ ($DEPLOY_CLIENT)}"
 
-  # ── Validate docker-compose.yml before building ────────────────────────────
-  check_compose_image
+  # ── Validate docker-compose.yml has ports mapping ────────────────────────
+  check_compose_ports
 
   do_build
   print_divider
