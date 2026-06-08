@@ -183,8 +183,8 @@ check_compose_image() {
   fi
   if ! grep -q "$IMAGE_NAME" docker-compose.yml; then
     step_err "Image name '$IMAGE_NAME' not found in docker-compose.yml"
-    printf "   Make sure your docker-compose.yml contains:  image: %s\n" "$IMAGE_NAME"
-    printf "   Current IMAGE_NAME in deploy.config.sh: %s\n" "$IMAGE_NAME"
+    printf "   Auto-fix:  setup-deploy --fix\n"
+    printf "   Or manually ensure docker-compose.yml contains:  image: %s\n" "$IMAGE_NAME"
     exit 1
   fi
   if ! grep -qE 'ports:' docker-compose.yml; then

@@ -1,14 +1,16 @@
 #!/bin/bash
 # ── setup-deploy ──────────────────────────────────────────────────────────────
-# Version: 2.0.0
+# Version: 2.1.0
 # Usage:
 #   setup-deploy                  → setup new project
 #   setup-deploy --install        → first time install on this Mac
 #   setup-deploy --update         → update deploy engine from GitHub
 #   setup-deploy --update-secrets → update server password in Keychain
+#   setup-deploy --fix            → auto-fix image name mismatch between
+#                                   deploy.config.sh and docker-compose.yml
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPLOY_VERSION="2.0.0"
+DEPLOY_VERSION="2.1.0"
 GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
 DEPLOY_DIR="$HOME/.deploy"
 
@@ -517,14 +519,115 @@ EOF
   printf "  ${CYAN}  ./deploy.sh stop      ${DIM}# stop server${NC}\n\n"
 }
 
+# ── Fix image name mismatch ───────────────────────────────────────────────────
+do_fix() {
+  header "setup-deploy — Fix Image Name Mismatch"
+
+  # ── Require both files ────────────────────────────────────────────────────
+  if [ ! -f "deploy.config.sh" ]; then
+    err "deploy.config.sh not found in current directory."
+    hint "Run from inside your project folder: cd my-project && setup-deploy --fix"
+    exit 1
+  fi
+  if [ ! -f "docker-compose.yml" ]; then
+    err "docker-compose.yml not found in current directory."
+    hint "Make sure docker-compose.yml exists in your project root"
+    exit 1
+  fi
+
+  source "deploy.config.sh"
+
+  # ── Extract image name from docker-compose.yml ────────────────────────────
+  # Matches lines like:  image: myapp  or  image: myapp:latest  (with any indent)
+  COMPOSE_IMAGE=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'" )
+
+  if [ -z "$COMPOSE_IMAGE" ]; then
+    err "No 'image:' line found in docker-compose.yml"
+    hint "Add an image line to your service, e.g.:  image: ${IMAGE_NAME}"
+    exit 1
+  fi
+
+  # ── Check if already matching ─────────────────────────────────────────────
+  if [ "$IMAGE_NAME" = "$COMPOSE_IMAGE" ]; then
+    success "No mismatch — IMAGE_NAME in deploy.config.sh already matches docker-compose.yml ('$IMAGE_NAME')"
+    printf "\n"
+    exit 0
+  fi
+
+  # ── Show the mismatch ─────────────────────────────────────────────────────
+  printf "  ${YELLOW}Mismatch detected:${NC}\n\n"
+  printf "  ${BOLD}deploy.config.sh  IMAGE_NAME${NC} = ${RED}%s${NC}\n" "$IMAGE_NAME"
+  printf "  ${BOLD}docker-compose.yml image:   ${NC} = ${RED}%s${NC}\n\n" "$COMPOSE_IMAGE"
+
+  printf "  Which value is correct?\n\n"
+  printf "  ${BOLD}1.${NC} Use ${GREEN}%-30s${NC} ${DIM}(update docker-compose.yml to match config)${NC}\n" "$IMAGE_NAME"
+  printf "  ${BOLD}2.${NC} Use ${GREEN}%-30s${NC} ${DIM}(update deploy.config.sh to match compose)${NC}\n" "$COMPOSE_IMAGE"
+  printf "  ${BOLD}3.${NC} Enter a new name manually\n\n"
+  printf "  ? Choice [1]: " >&2
+  read fix_choice
+  fix_choice="${fix_choice:-1}"
+
+  case "$fix_choice" in
+    1)
+      CORRECT_NAME="$IMAGE_NAME"
+      ;;
+    2)
+      CORRECT_NAME="$COMPOSE_IMAGE"
+      ;;
+    3)
+      while true; do
+        printf "  ? New image name (lowercase, no spaces): " >&2
+        read CORRECT_NAME
+        if echo "$CORRECT_NAME" | grep -qE '^[a-z0-9_-]+$'; then break
+        else
+          err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
+        fi
+      done
+      ;;
+    *)
+      err "Invalid choice. Run setup-deploy --fix again."
+      exit 1
+      ;;
+  esac
+
+  # ── Apply fix ─────────────────────────────────────────────────────────────
+  printf "\n"
+  info "Applying fix: image name = '$CORRECT_NAME'"
+  printf "\n"
+
+  # Fix deploy.config.sh
+  if [ "$IMAGE_NAME" != "$CORRECT_NAME" ]; then
+    sed -i.bak "s|^IMAGE_NAME=.*|IMAGE_NAME=\"${CORRECT_NAME}\"|" deploy.config.sh
+    rm -f deploy.config.sh.bak
+    success "deploy.config.sh updated  (IMAGE_NAME=\"$CORRECT_NAME\")"
+  else
+    info "deploy.config.sh already correct — no change"
+  fi
+
+  # Fix docker-compose.yml — replace the image: line, preserving any tag
+  if [ "$COMPOSE_IMAGE" != "$CORRECT_NAME" ]; then
+    # Replace image name but keep :tag if present (e.g. myapp:latest → newname:latest)
+    sed -i.bak "s|^\(\s*image\s*:\s*\)${COMPOSE_IMAGE}|\1${CORRECT_NAME}|g" docker-compose.yml
+    rm -f docker-compose.yml.bak
+    success "docker-compose.yml updated (image: $CORRECT_NAME)"
+  else
+    info "docker-compose.yml already correct — no change"
+  fi
+
+  printf "\n"
+  success "Fix applied! Both files now use image name: '$CORRECT_NAME'"
+  printf "\n  Run:  ${CYAN}./deploy.sh push${NC}  to deploy.\n\n"
+}
+
 # ── Router ────────────────────────────────────────────────────────────────────
 case "${1:-setup}" in
   --install)        do_install        ;;
   --update)         do_update         ;;
   --update-secrets) do_update_secrets ;;
+  --fix)            do_fix            ;;
   setup|"")         do_setup          ;;
   *)
-    printf "Usage: setup-deploy [--install | --update | --update-secrets]\n"
+    printf "Usage: setup-deploy [--install | --update | --update-secrets | --fix]\n"
     exit 1
     ;;
 esac
