@@ -623,7 +623,7 @@ do_push() {
 
     echo ""
     echo "  ── R9: Verifying containers are running ────────────────"
-    RUNNING=\$(docker compose ps 2>/dev/null | grep -c " Up \| running " || echo 0)
+    RUNNING=\$(docker compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after startup."
       echo ""
@@ -703,7 +703,7 @@ do_restart() {
     echo ""
     sleep 8
     echo "  ── Verifying containers are running ────────────────────"
-    RUNNING=\$(docker compose ps 2>/dev/null | grep -c " Up \| running " || echo 0)
+    RUNNING=\$(docker compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after restart."
       docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
