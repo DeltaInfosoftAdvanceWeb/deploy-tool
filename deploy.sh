@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── Universal Next.js Deploy Script ──────────────────────────────────────────
-# Version: 2.0.0
+# Version: 2.1.0
 # Usage:
 #   ./deploy.sh                        → build image + export tar
 #   ./deploy.sh push                   → build + upload + restart
@@ -14,7 +14,7 @@
 #   ./deploy.sh client --remove NAME   → remove client from .env
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPLOY_VERSION="2.0.0"
+DEPLOY_VERSION="2.1.0"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -171,6 +171,34 @@ check_ssh() {
     printf "   - Server is offline or unreachable\n"
     printf "   - SSH port blocked by firewall\n"
     exit 1
+  fi
+}
+
+# ── Validate docker-compose.yml has correct image name ───────────────────────
+check_compose_image() {
+  if [ ! -f "docker-compose.yml" ]; then
+    step_err "docker-compose.yml not found in current directory"
+    printf "   Make sure docker-compose.yml exists in your project root\n"
+    exit 1
+  fi
+  if ! grep -q "$IMAGE_NAME" docker-compose.yml; then
+    step_err "Image name '$IMAGE_NAME' not found in docker-compose.yml"
+    printf "   Make sure your docker-compose.yml contains:  image: %s\n" "$IMAGE_NAME"
+    printf "   Current IMAGE_NAME in deploy.config.sh: %s\n" "$IMAGE_NAME"
+    exit 1
+  fi
+  if ! grep -qE 'ports:' docker-compose.yml; then
+    step_warn "No 'ports:' section found in docker-compose.yml"
+    printf "   Without a ports mapping, the app will not be accessible from outside the container.\n"
+    printf "   Expected something like:\n"
+    printf "       ports:\n"
+    printf "         - \"%s:3000\"\n" "$APP_PORT"
+    printf "   Continue anyway? (y/N): " >&2
+    read _compose_confirm
+    if [ "$_compose_confirm" != "y" ] && [ "$_compose_confirm" != "Y" ]; then
+      printf "  Aborted. Fix docker-compose.yml and try again.\n"
+      exit 1
+    fi
   fi
 }
 
@@ -487,6 +515,9 @@ do_push() {
 
   print_header "Push to $SERVER_IP${DEPLOY_CLIENT:+ ($DEPLOY_CLIENT)}"
 
+  # ── Validate docker-compose.yml before building ────────────────────────────
+  check_compose_image
+
   do_build
   print_divider
 
@@ -521,12 +552,6 @@ do_push() {
   step_ok "Docker image tar uploaded"
 
   step_start "Uploading docker-compose.yml..."
-  if [ ! -f "docker-compose.yml" ]; then
-    step_err "docker-compose.yml not found in current directory"
-    printf "   Make sure docker-compose.yml exists in your project root\n"
-    [ -n "$CLEAN_ENV_FILE" ] && rm -f "$CLEAN_ENV_FILE"
-    exit 1
-  fi
   push_file_progress "docker-compose.yml" "$SERVER_PATH/"
   step_ok "docker-compose.yml uploaded"
 
@@ -547,7 +572,7 @@ do_push() {
   printf "${BOLD}[$(ts)] Loading image and restarting on server...${NC}\n\n"
 
   remote bash << REMOTE
-    set -e
+    set -eo pipefail
 
     echo "  [REMOTE] Working in: $SERVER_PATH"
     cd $SERVER_PATH
@@ -577,7 +602,7 @@ do_push() {
       exit 1
     fi
     LOAD_START=\$SECONDS
-    docker load -i $TAR_FILE 2>&1 | sed 's/^/  /'
+    docker load -i $TAR_FILE
     echo "  Load time: \$((SECONDS - LOAD_START))s"
 
     echo ""
@@ -586,31 +611,57 @@ do_push() {
 
     echo ""
     echo "  ── R6: Starting services ───────────────────────────────"
-    docker compose up -d 2>&1 | sed 's/^/  /'
+    docker compose up -d
+    echo "  docker compose up -d exited \$?"
 
     echo ""
-    echo "  ── R7: Waiting for containers (5s) ─────────────────────"
-    sleep 5
+    echo "  ── R7: Waiting for containers (8s) ─────────────────────"
+    sleep 8
 
     echo ""
     echo "  ── R8: Container status ────────────────────────────────"
     docker compose ps 2>&1 | sed 's/^/  /'
 
     echo ""
-    echo "  ── R9: Last 20 log lines ───────────────────────────────"
+    echo "  ── R9: Verifying containers are running ────────────────"
+    RUNNING=\$(docker compose ps --services --filter "status=running" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "\$RUNNING" -eq 0 ]; then
+      echo "  ERROR: No containers are running after startup."
+      echo ""
+      echo "  ── Last 50 log lines ───────────────────────────────────"
+      docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
+      exit 1
+    fi
+    echo "  Running containers: \$RUNNING"
+
+    echo ""
+    echo "  ── R10: Last 20 log lines ──────────────────────────────"
     docker compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
 
     echo ""
-    echo "  ── R10: Cleaning old images ────────────────────────────"
+    echo "  ── R11: Cleaning old images ────────────────────────────"
     docker image prune -f 2>&1 | sed 's/^/  /'
 
     echo ""
-    echo "  ── R11: Final disk usage ───────────────────────────────"
+    echo "  ── R12: Final disk usage ───────────────────────────────"
     df -h $SERVER_PATH | sed 's/^/  /'
 
     echo ""
     echo "  [REMOTE] All steps complete."
 REMOTE
+  REMOTE_EXIT=$?
+
+  if [ $REMOTE_EXIT -ne 0 ]; then
+    print_summary
+    step_err "Deployment FAILED (remote exit $REMOTE_EXIT)"
+    printf "  Check the output above for the exact error.\n"
+    printf "  Common causes:\n"
+    printf "   - Container crashed on startup — check logs above\n"
+    printf "   - Image name mismatch in docker-compose.yml (expected: %s)\n" "$IMAGE_NAME"
+    printf "   - Missing or wrong environment variables in .env\n"
+    printf "   - Port %s already in use on server\n\n" "$APP_PORT"
+    exit 1
+  fi
 
   print_summary
   printf "  ${GREEN}✅ Deployment complete!${NC}\n"
@@ -627,7 +678,7 @@ do_restart() {
   printf "\n"
 
   remote bash << REMOTE
-    set -e
+    set -eo pipefail
     cd $SERVER_PATH
 
     echo "  ── Stopping containers ─────────────────────────────────"
@@ -648,10 +699,20 @@ do_restart() {
 
     echo ""
     echo "  ── Starting services ───────────────────────────────────"
-    docker compose up -d 2>&1 | sed 's/^/  /'
+    docker compose up -d
 
     echo ""
-    sleep 5
+    sleep 8
+    echo "  ── Verifying containers are running ────────────────────"
+    RUNNING=\$(docker compose ps --services --filter "status=running" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "\$RUNNING" -eq 0 ]; then
+      echo "  ERROR: No containers are running after restart."
+      docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
+      exit 1
+    fi
+    echo "  Running containers: \$RUNNING"
+
+    echo ""
     echo "  ── Container status ────────────────────────────────────"
     docker compose ps 2>&1 | sed 's/^/  /'
 
@@ -659,6 +720,12 @@ do_restart() {
     echo "  ── Last 20 log lines ───────────────────────────────────"
     docker compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
 REMOTE
+  REMOTE_EXIT=$?
+
+  if [ $REMOTE_EXIT -ne 0 ]; then
+    step_err "Restart FAILED — check logs above"
+    exit 1
+  fi
 
   step_ok "Restart complete"
   printf "  ${BOLD}App URL :${NC} http://%s:%s\n\n" "$SERVER_IP" "$APP_PORT"
