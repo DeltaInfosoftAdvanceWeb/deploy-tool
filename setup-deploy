@@ -549,20 +549,62 @@ do_fix() {
   # Matches lines like:  image: myapp  or  image: myapp:latest  (with any indent)
   COMPOSE_IMAGE=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'" )
 
+  # ── Case 1: no image: line at all (e.g. dev compose using build:) ─────────
   if [ -z "$COMPOSE_IMAGE" ]; then
-    err "No 'image:' line found in docker-compose.yml"
-    hint "Add an image line to your service, e.g.:  image: ${IMAGE_NAME}"
-    exit 1
+    printf "  ${YELLOW}No 'image:' line found in docker-compose.yml${NC}\n\n"
+    printf "  The deploy tool needs an ${BOLD}image:${NC} line in your service so it can\n"
+    printf "  run the pre-built image instead of building from source on the server.\n\n"
+    printf "  IMAGE_NAME in deploy.config.sh: ${BOLD}${GREEN}%s${NC}\n\n" "$IMAGE_NAME"
+    printf "  Add   ${CYAN}image: %s${NC}   to your service in docker-compose.yml? (Y/n): " "$IMAGE_NAME" >&2
+    read add_confirm
+    add_confirm="${add_confirm:-y}"
+    if [ "$add_confirm" = "n" ] || [ "$add_confirm" = "N" ]; then
+      printf "  Aborted. Add the image: line manually and run again.\n\n"
+      exit 0
+    fi
+
+    # Find the first service block's first key (build:, command:, ports:, etc.)
+    # and insert image: above it, indented to match
+    local _tmp
+    _tmp=$(mktemp)
+    # Use awk: after we see a line matching "^\s+build:|command:|ports:|volumes:|env"
+    # inside a services block, insert image: once before the first such line
+    awk -v img="$IMAGE_NAME" '
+      /^services:/ { in_services=1 }
+      in_services && !inserted && /^[[:space:]]+(build|command|ports|volumes|environment|env_file|healthcheck)[[:space:]]*:/ {
+        # Capture the indentation of this line
+        match($0, /^[[:space:]]+/)
+        indent = substr($0, 1, RLENGTH)
+        print indent "image: " img
+        inserted=1
+      }
+      { print }
+    ' docker-compose.yml > "$_tmp"
+
+    if grep -q "image: $IMAGE_NAME" "$_tmp"; then
+      mv "$_tmp" docker-compose.yml
+      success "docker-compose.yml updated — added:  image: $IMAGE_NAME"
+    else
+      rm -f "$_tmp"
+      err "Could not auto-insert image: line. Please add it manually:"
+      printf "\n  services:\n    app:\n      image: %s\n      ...\n\n" "$IMAGE_NAME"
+      exit 1
+    fi
+
+    printf "\n"
+    success "Fix applied! docker-compose.yml now has:  image: $IMAGE_NAME"
+    printf "\n  Run:  ${CYAN}./deploy.sh push${NC}  to deploy.\n\n"
+    exit 0
   fi
 
-  # ── Check if already matching ─────────────────────────────────────────────
+  # ── Case 2: image: line exists but matches — nothing to do ────────────────
   if [ "$IMAGE_NAME" = "$COMPOSE_IMAGE" ]; then
-    success "No mismatch — IMAGE_NAME in deploy.config.sh already matches docker-compose.yml ('$IMAGE_NAME')"
+    success "No mismatch — IMAGE_NAME ('$IMAGE_NAME') already matches docker-compose.yml"
     printf "\n"
     exit 0
   fi
 
-  # ── Show the mismatch ─────────────────────────────────────────────────────
+  # ── Case 3: image: line exists but doesn't match ──────────────────────────
   printf "  ${YELLOW}Mismatch detected:${NC}\n\n"
   printf "  ${BOLD}deploy.config.sh  IMAGE_NAME${NC} = ${RED}%s${NC}\n" "$IMAGE_NAME"
   printf "  ${BOLD}docker-compose.yml image:   ${NC} = ${RED}%s${NC}\n\n" "$COMPOSE_IMAGE"
@@ -576,19 +618,14 @@ do_fix() {
   fix_choice="${fix_choice:-1}"
 
   case "$fix_choice" in
-    1)
-      CORRECT_NAME="$IMAGE_NAME"
-      ;;
-    2)
-      CORRECT_NAME="$COMPOSE_IMAGE"
-      ;;
+    1) CORRECT_NAME="$IMAGE_NAME" ;;
+    2) CORRECT_NAME="$COMPOSE_IMAGE" ;;
     3)
       while true; do
         printf "  ? New image name (lowercase, no spaces): " >&2
         read CORRECT_NAME
         if echo "$CORRECT_NAME" | grep -qE '^[a-z0-9_-]+$'; then break
-        else
-          err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
+        else err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
         fi
       done
       ;;
@@ -598,12 +635,10 @@ do_fix() {
       ;;
   esac
 
-  # ── Apply fix ─────────────────────────────────────────────────────────────
   printf "\n"
   info "Applying fix: image name = '$CORRECT_NAME'"
   printf "\n"
 
-  # Fix deploy.config.sh
   if [ "$IMAGE_NAME" != "$CORRECT_NAME" ]; then
     sed -i.bak "s|^IMAGE_NAME=.*|IMAGE_NAME=\"${CORRECT_NAME}\"|" deploy.config.sh
     rm -f deploy.config.sh.bak
@@ -612,9 +647,7 @@ do_fix() {
     info "deploy.config.sh already correct — no change"
   fi
 
-  # Fix docker-compose.yml — replace the image: line, preserving any tag
   if [ "$COMPOSE_IMAGE" != "$CORRECT_NAME" ]; then
-    # Replace image name but keep :tag if present (e.g. myapp:latest → newname:latest)
     sed -i.bak "s|^\(\s*image\s*:\s*\)${COMPOSE_IMAGE}|\1${CORRECT_NAME}|g" docker-compose.yml
     rm -f docker-compose.yml.bak
     success "docker-compose.yml updated (image: $CORRECT_NAME)"
