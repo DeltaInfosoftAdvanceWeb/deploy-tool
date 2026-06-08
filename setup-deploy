@@ -226,47 +226,80 @@ do_setup() {
     fi
   fi
 
-  echo -e "  ${DIM}Answer the questions below. Secrets are stored in macOS Keychain — never in files.${NC}"
+  echo "  Answer the questions below. Secrets are stored in macOS Keychain — never in files."
+  echo "  Press Enter to accept the [default value] shown in brackets."
   echo ""
 
-  # ── Collect non-secret config ──────────────────────────────────────────────
-  APP_NAME=$(ask "App name (e.g. MyProject)")
-  IMAGE_NAME=$(ask "Docker image name (e.g. myproject-app)" "$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')-app")
-  TAR_FILE=$(ask "Tar file name (e.g. myproject.tar)" "$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-').tar")
+  # ── App name ──────────────────────────────────────────────────────────────
+  echo "  ── Step 1 of 7: App Name ─────────────────────────────" >&2
+  echo "  This is just a label to identify your app (e.g. CostMetrix, MyShop)" >&2
+  APP_NAME=$(ask "App name")
+  APP_NAME_LOWER=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+  echo ""
 
-  # Validate IP
+  # ── Docker image name ─────────────────────────────────────────────────────
+  echo "  ── Step 2 of 7: Docker Image Name ───────────────────" >&2
+  echo "  Name for the Docker image (lowercase, no spaces, e.g. myapp-app)" >&2
+  IMAGE_NAME=$(ask "Docker image name" "${APP_NAME_LOWER}-app")
+  echo ""
+
+  # ── Tar file name ─────────────────────────────────────────────────────────
+  echo "  ── Step 3 of 7: Tar File Name ────────────────────────" >&2
+  echo "  Name for the exported Docker file (e.g. myapp.tar)" >&2
+  TAR_FILE=$(ask "Tar file name" "${APP_NAME_LOWER}.tar")
+  echo ""
+
+  # ── Server IP ─────────────────────────────────────────────────────────────
+  echo "  ── Step 4 of 7: Server IP Address ───────────────────" >&2
+  echo "  The IP address of your Linux server (e.g. 192.168.1.249)" >&2
   while true; do
-    SERVER_IP=$(ask "Server IP address (e.g. 192.168.1.100)")
+    SERVER_IP=$(ask "Server IP address")
     if validate_ip "$SERVER_IP"; then
       break
     else
-      warn "Invalid IP address. Please enter a valid IP (e.g. 192.168.1.249)"
+      echo "  ❌ Invalid IP address format. Must be like: 192.168.1.249" >&2
+      echo "  Please enter 4 numbers separated by dots." >&2
     fi
   done
+  echo ""
 
+  # ── Server user ───────────────────────────────────────────────────────────
+  echo "  ── Step 5 of 7: Server SSH Username ─────────────────" >&2
+  echo "  The username you use to SSH into your server" >&2
   SERVER_USER=$(ask "Server SSH username" "devadmin")
+  echo ""
 
-  # Validate port
+  # ── App port ──────────────────────────────────────────────────────────────
+  echo "  ── Step 6 of 7: App Port ─────────────────────────────" >&2
+  echo "  The port your app runs on (e.g. 3000, 5678, 8080)" >&2
   while true; do
     APP_PORT=$(ask "App port" "3000")
     if validate_port "$APP_PORT"; then
       break
     else
-      warn "Invalid port. Must be between 1 and 65535."
+      echo "  ❌ Invalid port. Must be a number between 1 and 65535." >&2
     fi
   done
+  echo ""
 
-  SERVER_PATH=$(ask "Server folder path" "~/${APP_NAME,,}")
+  # ── Server path ───────────────────────────────────────────────────────────
+  echo "  ── Step 7 of 7: Server Folder Path ──────────────────" >&2
+  echo "  Folder on the server where your app files will be stored" >&2
+  SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
+  echo ""
 
   # ── Collect secrets → Keychain ────────────────────────────────────────────
+  echo "  ── Secrets (stored in macOS Keychain — NOT saved in any file) ──"
   echo ""
-  echo -e "  ${BOLD}Secrets (stored in macOS Keychain — not in any file):${NC}"
-  echo ""
-
+  echo "  ── Secret 1 of 2: Server SSH Password ───────────────" >&2
+  echo "  Password to SSH into your server (will be hidden while typing)" >&2
   SERVER_PASS=$(ask_secret "Server SSH password")
   keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
   success "Server password saved to Keychain"
+  echo ""
 
+  echo "  ── Secret 2 of 2: Database URL ──────────────────────" >&2
+  echo "  Your full database connection string" >&2
   DATABASE_URL=$(ask_secret "Database URL")
   keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
   success "Database URL saved to Keychain"
