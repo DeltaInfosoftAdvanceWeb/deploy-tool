@@ -1,0 +1,350 @@
+#!/bin/bash
+# ── setup-deploy ──────────────────────────────────────────────────────────────
+# Universal deploy setup CLI for Next.js projects
+# Usage:
+#   setup-deploy                  → setup new project
+#   setup-deploy --install        → first time install on this Mac
+#   setup-deploy --update         → update deploy engine from GitHub
+#   setup-deploy --update-secrets → update passwords in Keychain
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -e
+
+DEPLOY_VERSION="1.0.0"
+GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
+DEPLOY_DIR="$HOME/.deploy"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+BOLD='\033[1m'
+DIM='\033[2m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info()    { echo -e "${DIM}  $1${NC}"; }
+success() { echo -e "${GREEN}  ✅ $1${NC}"; }
+warn()    { echo -e "${YELLOW}  ⚠️  $1${NC}"; }
+err()     { echo -e "${RED}  ❌ $1${NC}"; }
+header()  {
+  echo ""
+  echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
+  echo -e "${BOLD}${BLUE}  $1${NC}"
+  echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
+  echo ""
+}
+
+# ── Prompt helper (with validation) ──────────────────────────────────────────
+ask() {
+  local prompt="$1"
+  local default="$2"
+  local value=""
+  while [ -z "$value" ]; do
+    if [ -n "$default" ]; then
+      printf "${CYAN}  ? ${BOLD}%s${NC}${DIM} [%s]${NC}: " "$prompt" "$default"
+    else
+      printf "${CYAN}  ? ${BOLD}%s${NC}: " "$prompt"
+    fi
+    read value </dev/tty
+    if [ -z "$value" ] && [ -n "$default" ]; then
+      value="$default"
+    fi
+    if [ -z "$value" ]; then
+      warn "This field is required."
+    fi
+  done
+  echo "$value"
+}
+
+ask_secret() {
+  local prompt="$1"
+  local value=""
+  while [ -z "$value" ]; do
+    printf "${CYAN}  ? ${BOLD}%s${NC}${DIM} (hidden)${NC}: " "$prompt"
+    read -s value </dev/tty
+    echo ""
+    if [ -z "$value" ]; then
+      warn "This field is required."
+    fi
+  done
+  echo "$value"
+}
+
+validate_ip() {
+  local ip="$1"
+  if echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+validate_port() {
+  local port="$1"
+  if echo "$port" | grep -qE '^[0-9]+$' && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ── Keychain helpers ──────────────────────────────────────────────────────────
+keychain_save() {
+  local account="$1"
+  local service="$2"
+  local secret="$3"
+  security delete-generic-password -a "$account" -s "$service" 2>/dev/null || true
+  security add-generic-password -a "$account" -s "$service" -w "$secret"
+}
+
+keychain_get() {
+  local account="$1"
+  local service="$2"
+  security find-generic-password -a "$account" -s "$service" -w 2>/dev/null || echo ""
+}
+
+# ── Install on this Mac ───────────────────────────────────────────────────────
+do_install() {
+  header "setup-deploy — First Time Install v$DEPLOY_VERSION"
+
+  # Create ~/.deploy directory
+  info "Creating $DEPLOY_DIR ..."
+  mkdir -p "$DEPLOY_DIR"
+  success "Created $DEPLOY_DIR"
+
+  # Download deploy.sh from GitHub
+  info "Downloading deploy engine from GitHub..."
+  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh"; then
+    chmod +x "$DEPLOY_DIR/deploy.sh"
+    success "Deploy engine downloaded to $DEPLOY_DIR/deploy.sh"
+  else
+    err "Failed to download deploy.sh from GitHub"
+    err "Make sure your GitHub repo is public or you are authenticated"
+    exit 1
+  fi
+
+  # Create ~/bin if not exists
+  mkdir -p "$HOME/bin"
+
+  # Copy setup-deploy to ~/bin
+  info "Installing setup-deploy to $HOME/bin ..."
+  cp "$0" "$HOME/bin/setup-deploy"
+  chmod +x "$HOME/bin/setup-deploy"
+  success "Installed setup-deploy to $HOME/bin"
+
+  # Add ~/bin to PATH in ~/.zshrc if not already there
+  if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$HOME/.zshrc" 2>/dev/null; then
+    echo '' >> "$HOME/.zshrc"
+    echo '# deploy-tool' >> "$HOME/.zshrc"
+    echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.zshrc"
+    success "Added ~/bin to PATH in ~/.zshrc"
+  else
+    info "~/bin already in PATH — skipping"
+  fi
+
+  echo ""
+  success "Install complete!"
+  echo ""
+  echo -e "  ${BOLD}Run this to activate:${NC}"
+  echo -e "  ${CYAN}  source ~/.zshrc${NC}"
+  echo ""
+  echo -e "  ${BOLD}Then setup any project:${NC}"
+  echo -e "  ${CYAN}  cd your-project && setup-deploy${NC}"
+  echo ""
+}
+
+# ── Update deploy engine from GitHub ─────────────────────────────────────────
+do_update() {
+  header "setup-deploy — Update Engine"
+
+  info "Downloading latest deploy.sh from GitHub..."
+  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh"; then
+    chmod +x "$DEPLOY_DIR/deploy.sh"
+    success "Deploy engine updated at $DEPLOY_DIR/deploy.sh"
+    info "All projects will use the new version automatically."
+  else
+    err "Failed to download from GitHub"
+    exit 1
+  fi
+
+  # Also update setup-deploy itself
+  info "Updating setup-deploy CLI..."
+  if curl -fsSL "$GITHUB_RAW/setup-deploy" -o "$HOME/bin/setup-deploy"; then
+    chmod +x "$HOME/bin/setup-deploy"
+    success "setup-deploy CLI updated"
+  else
+    warn "Could not update setup-deploy CLI — skipping"
+  fi
+
+  echo ""
+  success "Update complete! All projects now use the latest deploy engine."
+  echo ""
+}
+
+# ── Update secrets in Keychain ────────────────────────────────────────────────
+do_update_secrets() {
+  header "setup-deploy — Update Secrets"
+
+  # Read APP_NAME from local deploy.config.sh
+  if [ ! -f "deploy.config.sh" ]; then
+    err "No deploy.config.sh found in current directory."
+    err "Run this from inside your project folder."
+    exit 1
+  fi
+  source "deploy.config.sh"
+
+  echo -e "  Updating secrets for: ${BOLD}$APP_NAME${NC}"
+  echo ""
+
+  SERVER_PASS=$(ask_secret "New server password")
+  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
+  success "Server password updated in Keychain"
+
+  DATABASE_URL=$(ask_secret "New database URL")
+  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
+  success "Database URL updated in Keychain"
+
+  echo ""
+  success "Secrets updated for $APP_NAME"
+  echo ""
+}
+
+# ── Setup new project ─────────────────────────────────────────────────────────
+do_setup() {
+  header "setup-deploy — New Project Setup v$DEPLOY_VERSION"
+
+  # Check we are in a Next.js project
+  if [ ! -f "package.json" ]; then
+    warn "No package.json found. Are you in a Next.js project folder?"
+    printf "  Continue anyway? (y/N): "
+    read confirm </dev/tty
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo "  Aborted."
+      exit 0
+    fi
+  fi
+
+  echo -e "  ${DIM}Answer the questions below. Secrets are stored in macOS Keychain — never in files.${NC}"
+  echo ""
+
+  # ── Collect non-secret config ──────────────────────────────────────────────
+  APP_NAME=$(ask "App name (e.g. MyProject)")
+  IMAGE_NAME=$(ask "Docker image name (e.g. myproject-app)" "$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')-app")
+  TAR_FILE=$(ask "Tar file name (e.g. myproject.tar)" "$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-').tar")
+
+  # Validate IP
+  while true; do
+    SERVER_IP=$(ask "Server IP address (e.g. 192.168.1.100)")
+    if validate_ip "$SERVER_IP"; then
+      break
+    else
+      warn "Invalid IP address. Please enter a valid IP (e.g. 192.168.1.249)"
+    fi
+  done
+
+  SERVER_USER=$(ask "Server SSH username" "devadmin")
+
+  # Validate port
+  while true; do
+    APP_PORT=$(ask "App port" "3000")
+    if validate_port "$APP_PORT"; then
+      break
+    else
+      warn "Invalid port. Must be between 1 and 65535."
+    fi
+  done
+
+  SERVER_PATH=$(ask "Server folder path" "~/${APP_NAME,,}")
+
+  # ── Collect secrets → Keychain ────────────────────────────────────────────
+  echo ""
+  echo -e "  ${BOLD}Secrets (stored in macOS Keychain — not in any file):${NC}"
+  echo ""
+
+  SERVER_PASS=$(ask_secret "Server SSH password")
+  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
+  success "Server password saved to Keychain"
+
+  DATABASE_URL=$(ask_secret "Database URL")
+  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
+  success "Database URL saved to Keychain"
+
+  # ── Write deploy.config.sh ────────────────────────────────────────────────
+  echo ""
+  info "Writing deploy.config.sh ..."
+
+  cat > deploy.config.sh << EOF
+# ── Deploy Configuration ──────────────────────────────────────────────────────
+# Generated by setup-deploy v$DEPLOY_VERSION
+# Secrets are stored in macOS Keychain — NOT here
+# Edit this file to change server settings, then re-run ./deploy.sh
+
+APP_NAME="$APP_NAME"
+IMAGE_NAME="$IMAGE_NAME"
+TAR_FILE="$TAR_FILE"
+SERVER_IP="$SERVER_IP"
+SERVER_USER="$SERVER_USER"
+SERVER_PATH="$SERVER_PATH"
+APP_PORT="$APP_PORT"
+EOF
+
+  success "deploy.config.sh created"
+
+  # ── Write deploy.sh (3-line wrapper) ──────────────────────────────────────
+  info "Writing deploy.sh ..."
+
+  cat > deploy.sh << 'EOF'
+#!/bin/bash
+# Generated by setup-deploy — safe to commit, no secrets here
+source "$HOME/.deploy/deploy.sh" "$@"
+EOF
+
+  chmod +x deploy.sh
+  success "deploy.sh created"
+
+  # ── Add deploy.config.sh to .gitignore ────────────────────────────────────
+  info "Updating .gitignore ..."
+  if [ ! -f ".gitignore" ]; then
+    touch .gitignore
+  fi
+
+  if ! grep -q "deploy.config.sh" .gitignore; then
+    echo "" >> .gitignore
+    echo "# deploy secrets" >> .gitignore
+    echo "deploy.config.sh" >> .gitignore
+    success "deploy.config.sh added to .gitignore"
+  else
+    info "deploy.config.sh already in .gitignore — skipping"
+  fi
+
+  # ── Done ──────────────────────────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+  echo -e "${BOLD}${GREEN}  ✅ Project setup complete!${NC}"
+  echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+  echo ""
+  echo -e "  ${BOLD}Files created:${NC}"
+  echo -e "  ${DIM}  deploy.sh         — safe to commit${NC}"
+  echo -e "  ${DIM}  deploy.config.sh  — gitignored (no secrets)${NC}"
+  echo ""
+  echo -e "  ${BOLD}Deploy commands:${NC}"
+  echo -e "  ${CYAN}  ./deploy.sh push      ${DIM}# build + upload + restart${NC}"
+  echo -e "  ${CYAN}  ./deploy.sh restart   ${DIM}# just restart${NC}"
+  echo -e "  ${CYAN}  ./deploy.sh logs      ${DIM}# tail logs${NC}"
+  echo -e "  ${CYAN}  ./deploy.sh stop      ${DIM}# stop server${NC}"
+  echo ""
+}
+
+# ── Router ────────────────────────────────────────────────────────────────────
+case "${1:-setup}" in
+  --install)        do_install        ;;
+  --update)         do_update         ;;
+  --update-secrets) do_update_secrets ;;
+  setup|"")         do_setup          ;;
+  *)
+    echo "Usage: setup-deploy [--install | --update | --update-secrets]"
+    exit 1
+    ;;
+esac
