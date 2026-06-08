@@ -8,9 +8,7 @@
 #   setup-deploy --update-secrets → update passwords in Keychain
 # ─────────────────────────────────────────────────────────────────────────────
 
-set -e
-
-DEPLOY_VERSION="1.0.0"
+DEPLOY_VERSION="1.1.0"
 GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
 DEPLOY_DIR="$HOME/.deploy"
 
@@ -22,21 +20,31 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-info()    { echo -e "${DIM}  $1${NC}"; }
-success() { echo -e "${GREEN}  ✅ $1${NC}"; }
-warn()    { echo -e "${YELLOW}  ⚠️  $1${NC}"; }
-err()     { echo -e "${RED}  ❌ $1${NC}"; }
-header()  {
-  echo ""
-  echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-  echo -e "${BOLD}${BLUE}  $1${NC}"
-  echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-  echo ""
+# ── Print helpers ─────────────────────────────────────────────────────────────
+info()    { printf "${DIM}  %s${NC}\n" "$1"; }
+success() { printf "${GREEN}  ✅ %s${NC}\n" "$1"; }
+warn()    { printf "${YELLOW}  ⚠️  %s${NC}\n" "$1"; }
+err()     { printf "${RED}  ❌ %s${NC}\n" "$1"; }
+hint()    { printf "${DIM}     → %s${NC}\n" "$1"; }
+
+header() {
+  printf "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"
+  printf "${BOLD}${BLUE}  %s${NC}\n" "$1"
+  printf "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n\n"
 }
 
-# ── Prompt helper (with validation) ──────────────────────────────────────────
+section() {
+  printf "\n${BOLD}${CYAN}  ── %s${NC}\n" "$1"
+}
+
+divider() {
+  printf "${DIM}  ──────────────────────────────────────────${NC}\n"
+}
+
+# ── Input helpers ─────────────────────────────────────────────────────────────
 ask() {
   local prompt="$1"
   local default="$2"
@@ -52,9 +60,24 @@ ask() {
       value="$default"
     fi
     if [ -z "$value" ]; then
-      echo "  ⚠️  This field is required." >&2
+      err "This field cannot be empty. Please enter a value." >&2
     fi
   done
+  echo "$value"
+}
+
+ask_optional() {
+  local prompt="$1"
+  local default="$2"
+  if [ -n "$default" ]; then
+    printf "  ? %s [%s] (optional, Enter to skip): " "$prompt" "$default" >&2
+  else
+    printf "  ? %s (optional, Enter to skip): " "$prompt" >&2
+  fi
+  read value
+  if [ -z "$value" ] && [ -n "$default" ]; then
+    value="$default"
+  fi
   echo "$value"
 }
 
@@ -62,32 +85,83 @@ ask_secret() {
   local prompt="$1"
   local value=""
   while [ -z "$value" ]; do
-    printf "  ? %s (hidden): " "$prompt" >&2
+    printf "  ? %s (hidden, required): " "$prompt" >&2
     read -s value
-    echo "" >&2
+    printf "\n" >&2
     if [ -z "$value" ]; then
-      echo "  ⚠️  This field is required." >&2
+      err "This field cannot be empty." >&2
     fi
   done
   echo "$value"
 }
 
+ask_number() {
+  local prompt="$1"
+  local default="$2"
+  local min="$3"
+  local max="$4"
+  local value=""
+  while true; do
+    if [ -n "$default" ]; then
+      printf "  ? %s [%s]: " "$prompt" "$default" >&2
+    else
+      printf "  ? %s: " "$prompt" >&2
+    fi
+    read value
+    if [ -z "$value" ] && [ -n "$default" ]; then
+      value="$default"
+    fi
+    if [ -z "$value" ]; then
+      err "This field cannot be empty." >&2
+      continue
+    fi
+    if ! echo "$value" | grep -qE '^[0-9]+$'; then
+      err "Must be a number, not text. You entered: $value" >&2
+      hint "Example: $default" >&2
+      continue
+    fi
+    if [ -n "$min" ] && [ "$value" -lt "$min" ]; then
+      err "Must be at least $min. You entered: $value" >&2
+      continue
+    fi
+    if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+      err "Must be at most $max. You entered: $value" >&2
+      continue
+    fi
+    break
+  done
+  echo "$value"
+}
+
+# ── Validators ────────────────────────────────────────────────────────────────
 validate_ip() {
   local ip="$1"
   if echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-    return 0
-  else
-    return 1
+    local a b c d
+    IFS='.' read -r a b c d <<< "$ip"
+    if [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ]; then
+      return 0
+    fi
   fi
+  return 1
 }
 
 validate_port() {
   local port="$1"
-  if echo "$port" | grep -qE '^[0-9]+$' && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-    return 0
-  else
-    return 1
-  fi
+  echo "$port" | grep -qE '^[0-9]+$' && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+validate_client_name() {
+  local name="$1"
+  echo "$name" | grep -qE '^[a-zA-Z0-9_-]+$'
+}
+
+validate_db_url() {
+  local url="$1"
+  [ -n "$url" ] && (
+    echo "$url" | grep -qiE 'server=|mongodb://|postgresql://|postgres://|mysql://|sqlite:|jdbc:' || \
+    echo "$url" | grep -qE '://'
+  )
 }
 
 # ── Keychain helpers ──────────────────────────────────────────────────────────
@@ -96,223 +170,365 @@ keychain_save() {
   local service="$2"
   local secret="$3"
   security delete-generic-password -a "$account" -s "$service" 2>/dev/null || true
-  security add-generic-password -a "$account" -s "$service" -w "$secret"
+  if ! security add-generic-password -a "$account" -s "$service" -w "$secret" 2>/dev/null; then
+    err "Failed to save to Keychain. Make sure you are on macOS."
+    exit 1
+  fi
 }
 
 keychain_get() {
-  local account="$1"
-  local service="$2"
-  security find-generic-password -a "$account" -s "$service" -w 2>/dev/null || echo ""
+  security find-generic-password -a "$1" -s "$2" -w 2>/dev/null || echo ""
 }
 
 # ── Install on this Mac ───────────────────────────────────────────────────────
 do_install() {
   header "setup-deploy — First Time Install v$DEPLOY_VERSION"
 
-  # Create ~/.deploy directory
   info "Creating $DEPLOY_DIR ..."
   mkdir -p "$DEPLOY_DIR"
   success "Created $DEPLOY_DIR"
 
-  # Download deploy.sh from GitHub
   info "Downloading deploy engine from GitHub..."
-  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh"; then
+  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh" 2>/dev/null; then
     chmod +x "$DEPLOY_DIR/deploy.sh"
-    success "Deploy engine downloaded to $DEPLOY_DIR/deploy.sh"
+    success "Deploy engine downloaded"
   else
     err "Failed to download deploy.sh from GitHub"
-    err "Make sure your GitHub repo is public or you are authenticated"
+    hint "Make sure the repo is public: github.com/DeltaInfosoftAdvanceWeb/deploy-tool"
     exit 1
   fi
 
-  # Create ~/bin if not exists
   mkdir -p "$HOME/bin"
-
-  # Copy setup-deploy to ~/bin
   info "Installing setup-deploy to $HOME/bin ..."
   cp "$0" "$HOME/bin/setup-deploy"
   chmod +x "$HOME/bin/setup-deploy"
   success "Installed setup-deploy to $HOME/bin"
 
-  # Add ~/bin to PATH in ~/.zshrc if not already there
   if ! grep -q 'export PATH="$HOME/bin:$PATH"' "$HOME/.zshrc" 2>/dev/null; then
-    echo '' >> "$HOME/.zshrc"
-    echo '# deploy-tool' >> "$HOME/.zshrc"
-    echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.zshrc"
+    printf '\n# deploy-tool\nexport PATH="$HOME/bin:$PATH"\n' >> "$HOME/.zshrc"
     success "Added ~/bin to PATH in ~/.zshrc"
   else
     info "~/bin already in PATH — skipping"
   fi
 
-  echo ""
+  printf "\n"
   success "Install complete!"
-  echo ""
-  echo -e "  ${BOLD}Run this to activate:${NC}"
-  echo -e "  ${CYAN}  source ~/.zshrc${NC}"
-  echo ""
-  echo -e "  ${BOLD}Then setup any project:${NC}"
-  echo -e "  ${CYAN}  cd your-project && setup-deploy${NC}"
-  echo ""
+  printf "\n"
+  printf "  ${BOLD}Run this to activate:${NC}\n"
+  printf "  ${CYAN}    source ~/.zshrc${NC}\n\n"
+  printf "  ${BOLD}Then setup any project:${NC}\n"
+  printf "  ${CYAN}    cd your-project && setup-deploy${NC}\n\n"
 }
 
-# ── Update deploy engine from GitHub ─────────────────────────────────────────
+# ── Update engine from GitHub ─────────────────────────────────────────────────
 do_update() {
   header "setup-deploy — Update Engine"
 
   info "Downloading latest deploy.sh from GitHub..."
-  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh"; then
+  if curl -fsSL "$GITHUB_RAW/deploy.sh" -o "$DEPLOY_DIR/deploy.sh" 2>/dev/null; then
     chmod +x "$DEPLOY_DIR/deploy.sh"
-    success "Deploy engine updated at $DEPLOY_DIR/deploy.sh"
+    success "Deploy engine updated"
     info "All projects will use the new version automatically."
   else
     err "Failed to download from GitHub"
+    hint "Check your internet connection or repo visibility"
     exit 1
   fi
 
-  # Also update setup-deploy itself
   info "Updating setup-deploy CLI..."
-  if curl -fsSL "$GITHUB_RAW/setup-deploy" -o "$HOME/bin/setup-deploy"; then
+  if curl -fsSL "$GITHUB_RAW/setup-deploy" -o "$HOME/bin/setup-deploy" 2>/dev/null; then
     chmod +x "$HOME/bin/setup-deploy"
     success "setup-deploy CLI updated"
   else
     warn "Could not update setup-deploy CLI — skipping"
   fi
 
-  echo ""
+  printf "\n"
   success "Update complete! All projects now use the latest deploy engine."
-  echo ""
+  printf "\n"
 }
 
-# ── Update secrets in Keychain ────────────────────────────────────────────────
+# ── Update secrets ────────────────────────────────────────────────────────────
 do_update_secrets() {
   header "setup-deploy — Update Secrets"
 
-  # Read APP_NAME from local deploy.config.sh
   if [ ! -f "deploy.config.sh" ]; then
     err "No deploy.config.sh found in current directory."
-    err "Run this from inside your project folder."
+    hint "Run this command from inside your project folder."
+    hint "Example: cd ~/my-project && setup-deploy --update-secrets"
     exit 1
   fi
   source "deploy.config.sh"
 
-  echo -e "  Updating secrets for: ${BOLD}$APP_NAME${NC}"
-  echo ""
+  printf "  Updating secrets for: ${BOLD}%s${NC}\n\n" "$APP_NAME"
 
+  section "Server SSH Password"
   SERVER_PASS=$(ask_secret "New server password")
   keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
   success "Server password updated in Keychain"
 
-  DATABASE_URL=$(ask_secret "New database URL")
-  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
-  success "Database URL updated in Keychain"
+  # Update each DB client secret
+  if [ -n "$DB_CLIENTS" ]; then
+    for client in $DB_CLIENTS; do
+      section "Database: $client"
+      DB_URL=$(ask_secret "New DB URL for $client")
+      keychain_save "$SERVER_USER" "deploy-${APP_NAME}-db-${client}-url" "$DB_URL"
+      success "DB URL updated for $client"
 
-  echo ""
-  success "Secrets updated for $APP_NAME"
-  echo ""
+      has_id_var="DB_${client}_HAS_CLIENT_ID"
+      if [ "${!has_id_var}" = "true" ]; then
+        CLIENT_ID=$(ask_secret "New Client ID for $client")
+        keychain_save "$SERVER_USER" "deploy-${APP_NAME}-db-${client}-clientid" "$CLIENT_ID"
+        success "Client ID updated for $client"
+      fi
+    done
+  else
+    section "Database URL"
+    DATABASE_URL=$(ask_secret "New database URL")
+    keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
+    success "Database URL updated"
+  fi
+
+  printf "\n"
+  success "All secrets updated for $APP_NAME"
+  printf "\n"
 }
 
 # ── Setup new project ─────────────────────────────────────────────────────────
 do_setup() {
   header "setup-deploy — New Project Setup v$DEPLOY_VERSION"
 
-  # Check we are in a Next.js project
   if [ ! -f "package.json" ]; then
-    warn "No package.json found. Are you in a Next.js project folder?"
+    warn "No package.json found here. Are you inside a Next.js project folder?"
+    hint "Example: cd ~/Downloads/Developer/MyProject"
     printf "  Continue anyway? (y/N): " >&2
     read confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-      echo "  Aborted."
+      printf "  Aborted.\n"
       exit 0
     fi
   fi
 
-  echo "  Answer the questions below. Secrets are stored in macOS Keychain — never in files."
-  echo "  Press Enter to accept the [default value] shown in brackets."
-  echo ""
+  printf "  ${DIM}Answer each question below. Press Enter to use the [default] value.${NC}\n"
+  printf "  ${DIM}Secrets (passwords, DB URLs) are stored in macOS Keychain — never in files.${NC}\n\n"
 
-  # ── App name ──────────────────────────────────────────────────────────────
-  echo "  ── Step 1 of 7: App Name ─────────────────────────────" >&2
-  echo "  This is just a label to identify your app (e.g. CostMetrix, MyShop)" >&2
-  APP_NAME=$(ask "App name")
-  APP_NAME_LOWER=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-  echo ""
-
-  # ── Docker image name ─────────────────────────────────────────────────────
-  echo "  ── Step 2 of 7: Docker Image Name ───────────────────" >&2
-  echo "  Name for the Docker image (lowercase, no spaces, e.g. myapp-app)" >&2
-  IMAGE_NAME=$(ask "Docker image name" "${APP_NAME_LOWER}-app")
-  echo ""
-
-  # ── Tar file name ─────────────────────────────────────────────────────────
-  echo "  ── Step 3 of 7: Tar File Name ────────────────────────" >&2
-  echo "  Name for the exported Docker file (e.g. myapp.tar)" >&2
-  TAR_FILE=$(ask "Tar file name" "${APP_NAME_LOWER}.tar")
-  echo ""
-
-  # ── Server IP ─────────────────────────────────────────────────────────────
-  echo "  ── Step 4 of 7: Server IP Address ───────────────────" >&2
-  echo "  The IP address of your Linux server (e.g. 192.168.1.249)" >&2
+  # ── Loop until user confirms summary ──────────────────────────────────────
   while true; do
-    SERVER_IP=$(ask "Server IP address")
-    if validate_ip "$SERVER_IP"; then
+
+    # ── Step 1: App Name ────────────────────────────────────────────────────
+    section "Step 1 of 8 — App Name"
+    info "A label to identify your app (e.g. CostMetrix, DeltaAuth, MyShop)"
+    while true; do
+      APP_NAME=$(ask "App name")
+      if echo "$APP_NAME" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        break
+      else
+        err "App name can only contain letters, numbers, hyphens, underscores." >&2
+        hint "No spaces or special characters. Example: MyApp, delta-auth" >&2
+      fi
+    done
+    APP_NAME_LOWER=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+    printf "\n"
+
+    # ── Step 2: Docker Image Name ────────────────────────────────────────────
+    section "Step 2 of 8 — Docker Image Name"
+    info "Name for the Docker image (lowercase, no spaces)"
+    while true; do
+      IMAGE_NAME=$(ask "Docker image name" "${APP_NAME_LOWER}-app")
+      if echo "$IMAGE_NAME" | grep -qE '^[a-z0-9_-]+$'; then
+        break
+      else
+        err "Image name must be lowercase with no spaces." >&2
+        hint "Example: myapp-app, delta-auth-app" >&2
+      fi
+    done
+    printf "\n"
+
+    # ── Step 3: Tar File Name ────────────────────────────────────────────────
+    section "Step 3 of 8 — Tar File Name"
+    info "Name for the exported Docker archive file"
+    while true; do
+      TAR_FILE=$(ask "Tar file name" "${APP_NAME_LOWER}.tar")
+      if echo "$TAR_FILE" | grep -qE '\.tar$'; then
+        break
+      else
+        err "Tar file name must end with .tar" >&2
+        hint "Example: myapp.tar, delta-auth.tar" >&2
+      fi
+    done
+    printf "\n"
+
+    # ── Step 4: Server IP ────────────────────────────────────────────────────
+    section "Step 4 of 8 — Server IP Address"
+    info "The IP address of your Linux deployment server"
+    while true; do
+      SERVER_IP=$(ask "Server IP address (e.g. 192.168.1.249)")
+      if validate_ip "$SERVER_IP"; then
+        break
+      else
+        err "Invalid IP address format. You entered: $SERVER_IP" >&2
+        hint "Must be 4 numbers separated by dots. Example: 192.168.1.249" >&2
+      fi
+    done
+    printf "\n"
+
+    # ── Step 5: Server User ──────────────────────────────────────────────────
+    section "Step 5 of 8 — Server SSH Username"
+    info "The username to SSH into your server"
+    while true; do
+      SERVER_USER=$(ask "Server SSH username" "devadmin")
+      if echo "$SERVER_USER" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        break
+      else
+        err "Username cannot contain spaces or special characters." >&2
+        hint "Example: devadmin, ubuntu, root" >&2
+      fi
+    done
+    printf "\n"
+
+    # ── Step 6: App Port ─────────────────────────────────────────────────────
+    section "Step 6 of 8 — App Port"
+    info "The port your app will run on (must not be already in use on the server)"
+    while true; do
+      APP_PORT=$(ask_number "App port" "3000" "1" "65535")
+      if validate_port "$APP_PORT"; then
+        break
+      fi
+    done
+    printf "\n"
+
+    # ── Step 7: Server Path ──────────────────────────────────────────────────
+    section "Step 7 of 8 — Server Folder Path"
+    info "Folder on the server where your app files will be uploaded"
+    SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
+    printf "\n"
+
+    # ── Step 8: Database Clients ─────────────────────────────────────────────
+    section "Step 8 of 8 — Database Configuration"
+    info "You can add one or multiple database connections"
+    printf "\n"
+
+    DB_CLIENT_COUNT=$(ask_number "How many database clients/connections?" "1" "1" "10")
+    printf "\n"
+
+    DB_CLIENTS=""
+    DB_CLIENTS_DISPLAY=""
+    declare -A DB_HAS_CLIENT_ID
+
+    i=1
+    while [ "$i" -le "$DB_CLIENT_COUNT" ]; do
+      printf "  ${BOLD}${CYAN}── Database Client $i of $DB_CLIENT_COUNT ──${NC}\n"
+
+      # Client name
+      while true; do
+        DB_CLIENT_NAME=$(ask "Client name (e.g. MainDB, CostMetrix, AuthDB)")
+        if validate_client_name "$DB_CLIENT_NAME"; then
+          # Check for duplicate
+          if echo "$DB_CLIENTS" | grep -qw "$DB_CLIENT_NAME"; then
+            err "Client name '$DB_CLIENT_NAME' already used. Please use a unique name." >&2
+          else
+            break
+          fi
+        else
+          err "Client name can only have letters, numbers, hyphens, underscores. No spaces." >&2
+          hint "Example: MainDB, auth-db, CostMetrix" >&2
+        fi
+      done
+
+      # DB URL
+      while true; do
+        DB_URL=$(ask_secret "Database URL for $DB_CLIENT_NAME")
+        if validate_db_url "$DB_URL"; then
+          break
+        else
+          err "Database URL looks incorrect. You entered something that doesn't look like a valid connection string." >&2
+          hint "SQL Server example:  Server='192.168.1.239\\DB,1433;Database=MyDB;User Id=sa;Password=pass'" >&2
+          hint "MongoDB example:     mongodb://user:pass@192.168.1.239:27017/mydb" >&2
+          hint "PostgreSQL example:  postgresql://user:pass@192.168.1.239:5432/mydb" >&2
+          printf "  Force accept anyway? (y/N): " >&2
+          read force_accept
+          if [ "$force_accept" = "y" ] || [ "$force_accept" = "Y" ]; then
+            break
+          fi
+        fi
+      done
+      keychain_save "$SERVER_USER" "deploy-${APP_NAME}-db-${DB_CLIENT_NAME}-url" "$DB_URL"
+      success "DB URL for $DB_CLIENT_NAME saved to Keychain"
+
+      # Client ID (optional)
+      CLIENT_ID=$(ask_optional "Client ID for $DB_CLIENT_NAME")
+      if [ -n "$CLIENT_ID" ]; then
+        keychain_save "$SERVER_USER" "deploy-${APP_NAME}-db-${DB_CLIENT_NAME}-clientid" "$CLIENT_ID"
+        success "Client ID for $DB_CLIENT_NAME saved to Keychain"
+        DB_HAS_CLIENT_ID[$DB_CLIENT_NAME]="true"
+        DB_CLIENTS_DISPLAY="${DB_CLIENTS_DISPLAY}  - $DB_CLIENT_NAME (URL ✅, Client ID ✅)\n"
+      else
+        DB_HAS_CLIENT_ID[$DB_CLIENT_NAME]="false"
+        DB_CLIENTS_DISPLAY="${DB_CLIENTS_DISPLAY}  - $DB_CLIENT_NAME (URL ✅, Client ID —)\n"
+      fi
+
+      DB_CLIENTS="$DB_CLIENTS $DB_CLIENT_NAME"
+      i=$((i + 1))
+      printf "\n"
+    done
+
+    DB_CLIENTS=$(echo "$DB_CLIENTS" | xargs)
+
+    # ── Server Password ──────────────────────────────────────────────────────
+    section "Server SSH Password"
+    info "Password to SSH into your server (hidden while typing)"
+    SERVER_PASS=$(ask_secret "Server SSH password")
+    keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
+    success "Server password saved to Keychain"
+    printf "\n"
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    printf "\n"
+    printf "${BOLD}${MAGENTA}══════════════════════════════════════════${NC}\n"
+    printf "${BOLD}${MAGENTA}  Review Your Configuration${NC}\n"
+    printf "${BOLD}${MAGENTA}══════════════════════════════════════════${NC}\n\n"
+    printf "  ${BOLD}App name        :${NC} $APP_NAME\n"
+    printf "  ${BOLD}Docker image    :${NC} $IMAGE_NAME\n"
+    printf "  ${BOLD}Tar file        :${NC} $TAR_FILE\n"
+    printf "  ${BOLD}Server IP       :${NC} $SERVER_IP\n"
+    printf "  ${BOLD}SSH username    :${NC} $SERVER_USER\n"
+    printf "  ${BOLD}App port        :${NC} $APP_PORT\n"
+    printf "  ${BOLD}Server path     :${NC} $SERVER_PATH\n"
+    printf "  ${BOLD}DB clients      :${NC}\n"
+    printf "$DB_CLIENTS_DISPLAY"
+    printf "  ${BOLD}SSH password    :${NC} ${DIM}(stored in Keychain)${NC}\n"
+    printf "\n"
+    divider
+    printf "\n"
+    printf "  ${YELLOW}Does everything look correct?${NC}\n"
+    printf "  ${DIM}Press 'y' to save and continue, 'n' to start over.${NC}\n\n"
+    printf "  Confirm? (y/N): " >&2
+    read final_confirm
+    printf "\n"
+
+    if [ "$final_confirm" = "y" ] || [ "$final_confirm" = "Y" ]; then
       break
     else
-      echo "  ❌ Invalid IP address format. Must be like: 192.168.1.249" >&2
-      echo "  Please enter 4 numbers separated by dots." >&2
+      warn "Starting over. Please re-enter your configuration."
+      printf "\n"
     fi
+
   done
-  echo ""
 
-  # ── Server user ───────────────────────────────────────────────────────────
-  echo "  ── Step 5 of 7: Server SSH Username ─────────────────" >&2
-  echo "  The username you use to SSH into your server" >&2
-  SERVER_USER=$(ask "Server SSH username" "devadmin")
-  echo ""
-
-  # ── App port ──────────────────────────────────────────────────────────────
-  echo "  ── Step 6 of 7: App Port ─────────────────────────────" >&2
-  echo "  The port your app runs on (e.g. 3000, 5678, 8080)" >&2
-  while true; do
-    APP_PORT=$(ask "App port" "3000")
-    if validate_port "$APP_PORT"; then
-      break
-    else
-      echo "  ❌ Invalid port. Must be a number between 1 and 65535." >&2
-    fi
-  done
-  echo ""
-
-  # ── Server path ───────────────────────────────────────────────────────────
-  echo "  ── Step 7 of 7: Server Folder Path ──────────────────" >&2
-  echo "  Folder on the server where your app files will be stored" >&2
-  SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
-  echo ""
-
-  # ── Collect secrets → Keychain ────────────────────────────────────────────
-  echo "  ── Secrets (stored in macOS Keychain — NOT saved in any file) ──"
-  echo ""
-  echo "  ── Secret 1 of 2: Server SSH Password ───────────────" >&2
-  echo "  Password to SSH into your server (will be hidden while typing)" >&2
-  SERVER_PASS=$(ask_secret "Server SSH password")
-  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-server" "$SERVER_PASS"
-  success "Server password saved to Keychain"
-  echo ""
-
-  echo "  ── Secret 2 of 2: Database URL ──────────────────────" >&2
-  echo "  Your full database connection string" >&2
-  DATABASE_URL=$(ask_secret "Database URL")
-  keychain_save "$SERVER_USER" "deploy-${APP_NAME}-dburl" "$DATABASE_URL"
-  success "Database URL saved to Keychain"
-
-  # ── Write deploy.config.sh ────────────────────────────────────────────────
-  echo ""
+  # ── Write deploy.config.sh ──────────────────────────────────────────────────
   info "Writing deploy.config.sh ..."
+
+  # Build DB_HAS_CLIENT_ID lines
+  DB_CLIENT_ID_LINES=""
+  for client in $DB_CLIENTS; do
+    DB_CLIENT_ID_LINES="${DB_CLIENT_ID_LINES}DB_${client}_HAS_CLIENT_ID=\"${DB_HAS_CLIENT_ID[$client]}\"\n"
+  done
 
   cat > deploy.config.sh << EOF
 # ── Deploy Configuration ──────────────────────────────────────────────────────
 # Generated by setup-deploy v$DEPLOY_VERSION
-# Secrets are stored in macOS Keychain — NOT here
-# Edit this file to change server settings, then re-run ./deploy.sh
+# Secrets are stored in macOS Keychain — NOT in this file
+# Edit values here and re-run ./deploy.sh if settings change
 
 APP_NAME="$APP_NAME"
 IMAGE_NAME="$IMAGE_NAME"
@@ -321,53 +537,51 @@ SERVER_IP="$SERVER_IP"
 SERVER_USER="$SERVER_USER"
 SERVER_PATH="$SERVER_PATH"
 APP_PORT="$APP_PORT"
+
+# Database clients (space-separated list)
+DB_CLIENTS="$DB_CLIENTS"
+
+# Which clients have a Client ID stored in Keychain
+$(printf "$DB_CLIENT_ID_LINES")
 EOF
 
   success "deploy.config.sh created"
 
-  # ── Write deploy.sh (3-line wrapper) ──────────────────────────────────────
+  # ── Write deploy.sh wrapper ─────────────────────────────────────────────────
   info "Writing deploy.sh ..."
-
   cat > deploy.sh << 'EOF'
 #!/bin/bash
-# Generated by setup-deploy — safe to commit, no secrets here
+# Generated by setup-deploy — safe to commit, contains no secrets
 source "$HOME/.deploy/deploy.sh" "$@"
 EOF
-
   chmod +x deploy.sh
   success "deploy.sh created"
 
-  # ── Add deploy.config.sh to .gitignore ────────────────────────────────────
+  # ── Update .gitignore ────────────────────────────────────────────────────────
   info "Updating .gitignore ..."
-  if [ ! -f ".gitignore" ]; then
-    touch .gitignore
-  fi
-
+  [ ! -f ".gitignore" ] && touch .gitignore
   if ! grep -q "deploy.config.sh" .gitignore; then
-    echo "" >> .gitignore
-    echo "# deploy secrets" >> .gitignore
-    echo "deploy.config.sh" >> .gitignore
+    printf "\n# deploy tool\ndeploy.config.sh\n" >> .gitignore
     success "deploy.config.sh added to .gitignore"
   else
-    info "deploy.config.sh already in .gitignore — skipping"
+    info "deploy.config.sh already in .gitignore"
   fi
 
-  # ── Done ──────────────────────────────────────────────────────────────────
-  echo ""
-  echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
-  echo -e "${BOLD}${GREEN}  ✅ Project setup complete!${NC}"
-  echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
-  echo ""
-  echo -e "  ${BOLD}Files created:${NC}"
-  echo -e "  ${DIM}  deploy.sh         — safe to commit${NC}"
-  echo -e "  ${DIM}  deploy.config.sh  — gitignored (no secrets)${NC}"
-  echo ""
-  echo -e "  ${BOLD}Deploy commands:${NC}"
-  echo -e "  ${CYAN}  ./deploy.sh push      ${DIM}# build + upload + restart${NC}"
-  echo -e "  ${CYAN}  ./deploy.sh restart   ${DIM}# just restart${NC}"
-  echo -e "  ${CYAN}  ./deploy.sh logs      ${DIM}# tail logs${NC}"
-  echo -e "  ${CYAN}  ./deploy.sh stop      ${DIM}# stop server${NC}"
-  echo ""
+  # ── Done ────────────────────────────────────────────────────────────────────
+  printf "\n"
+  printf "${BOLD}${GREEN}══════════════════════════════════════════${NC}\n"
+  printf "${BOLD}${GREEN}  ✅ Project setup complete!${NC}\n"
+  printf "${BOLD}${GREEN}══════════════════════════════════════════${NC}\n\n"
+  printf "  ${BOLD}Files created:${NC}\n"
+  printf "  ${DIM}  deploy.sh         — safe to commit${NC}\n"
+  printf "  ${DIM}  deploy.config.sh  — gitignored, no secrets${NC}\n\n"
+  printf "  ${BOLD}Deploy commands:${NC}\n"
+  printf "  ${CYAN}  ./deploy.sh push      ${DIM}# build + upload + restart${NC}\n"
+  printf "  ${CYAN}  ./deploy.sh restart   ${DIM}# just restart server${NC}\n"
+  printf "  ${CYAN}  ./deploy.sh logs      ${DIM}# tail live logs${NC}\n"
+  printf "  ${CYAN}  ./deploy.sh stop      ${DIM}# stop server${NC}\n\n"
+  printf "  ${BOLD}If you need to update secrets later:${NC}\n"
+  printf "  ${CYAN}  setup-deploy --update-secrets${NC}\n\n"
 }
 
 # ── Router ────────────────────────────────────────────────────────────────────
@@ -377,7 +591,7 @@ case "${1:-setup}" in
   --update-secrets) do_update_secrets ;;
   setup|"")         do_setup          ;;
   *)
-    echo "Usage: setup-deploy [--install | --update | --update-secrets]"
+    printf "Usage: setup-deploy [--install | --update | --update-secrets]\n"
     exit 1
     ;;
 esac
