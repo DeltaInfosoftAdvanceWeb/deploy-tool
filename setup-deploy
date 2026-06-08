@@ -216,16 +216,24 @@ do_update() {
   fi
 
   info "Updating setup-deploy CLI..."
-  if curl -fsSL "$GITHUB_RAW/setup-deploy" -o "$HOME/bin/setup-deploy" 2>/dev/null; then
-    chmod +x "$HOME/bin/setup-deploy"
+  local _tmp_setup
+  _tmp_setup=$(mktemp)
+  if curl -fsSL "$GITHUB_RAW/setup-deploy" -o "$_tmp_setup" 2>/dev/null; then
+    chmod +x "$_tmp_setup"
+    mv "$_tmp_setup" "$HOME/bin/setup-deploy"
     success "setup-deploy CLI updated"
   else
+    rm -f "$_tmp_setup"
     warn "Could not update setup-deploy CLI"
   fi
 
   printf "\n"
   success "Update complete!"
   printf "\n"
+  # Exit immediately — the current script file was just replaced on disk.
+  # If bash reads the next chunk from the new file at the old offset it will
+  # execute garbage. Exiting here ensures only the old in-memory code runs.
+  exit 0
 }
 
 # ── Update secrets ────────────────────────────────────────────────────────────
