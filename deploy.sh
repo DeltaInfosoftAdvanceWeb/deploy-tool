@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── Universal Next.js Deploy Script ──────────────────────────────────────────
-# Version: 2.1.0
+# Version: 2.2.0
 # Usage:
 #   ./deploy.sh                        → build image + export tar
 #   ./deploy.sh push                   → build + upload + restart
@@ -14,7 +14,7 @@
 #   ./deploy.sh client --remove NAME   → remove client from .env
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPLOY_VERSION="2.1.0"
+DEPLOY_VERSION="2.2.0"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -341,7 +341,8 @@ do_client_add() {
 }
 
 do_client_remove() {
-  local client="$2"
+  # $1 = "client", $2 = "--remove", $3 = CLIENT_NAME
+  local client="$3"
   if [ -z "$client" ]; then
     printf "  Usage: ./deploy.sh client --remove CLIENT_NAME\n"
     exit 1
@@ -367,9 +368,30 @@ do_client_remove() {
     exit 0
   fi
 
-  # Remove lines containing this client
-  local tmp=$(mktemp)
-  grep -v "CLIENT_ID=${client}" .env | grep -v "CLIENT_ID= *${client}" > "$tmp"
+  # Remove both the CLIENT_ID line and the NEXT_PUBLIC_API_BASE_URL line paired with it
+  local tmp
+  tmp=$(mktemp)
+  awk -v client="$client" '
+    /^#?[[:space:]]*(NEXT_PUBLIC_API_BASE_URL)[[:space:]]*=/ {
+      pending = $0
+      next
+    }
+    /^#?[[:space:]]*CLIENT_ID[[:space:]]*=[[:space:]]*/ {
+      if (index($0, client) > 0) {
+        # Drop both this line and the pending URL line
+        pending = ""
+        next
+      } else {
+        if (pending != "") { print pending; pending = "" }
+        print
+        next
+      }
+    }
+    {
+      if (pending != "") { print pending; pending = "" }
+      print
+    }
+  ' .env > "$tmp"
   mv "$tmp" .env
 
   printf "${GREEN}  ✅ Client '%s' removed from .env${NC}\n\n" "$client"
@@ -554,8 +576,7 @@ do_push() {
   push_file_progress "$TAR_FILE" "$SERVER_PATH/"
   step_ok "Docker image tar uploaded"
 
-
- step_start "Generating production docker-compose.yml..."
+  step_start "Generating production docker-compose.yml..."
   PROD_COMPOSE=$(mktemp /tmp/docker-compose-prod-XXXX.yml)
   cat > "$PROD_COMPOSE" << COMPOSEFILE
 services:
@@ -603,23 +624,31 @@ COMPOSEFILE
   remote bash << REMOTE
     set -eo pipefail
 
+    # ── Detect whether docker needs sudo ─────────────────────────────────────
+    if groups | grep -q docker 2>/dev/null; then
+      DCMD="docker"
+    else
+      DCMD="sudo docker"
+    fi
+    echo "  [REMOTE] Docker command: \$DCMD"
+
     echo "  [REMOTE] Working in: $SERVER_PATH"
     cd $SERVER_PATH
 
     echo ""
     echo "  ── R1: Stopping existing containers ───────────────────"
-    docker compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
+    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
 
     echo ""
     echo "  ── R2: Removing known containers ──────────────────────"
-    docker rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
+    \$DCMD rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
 
     echo ""
     echo "  ── R3: Checking port conflicts on $APP_PORT ────────────"
-    CONFLICTING=\$(docker ps -q --filter "publish=$APP_PORT")
+    CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT")
     if [ -n "\$CONFLICTING" ]; then
       echo "  Removing conflicting containers: \$CONFLICTING"
-      docker rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
+      \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
     else
       echo "  No port conflicts on $APP_PORT"
     fi
@@ -631,16 +660,16 @@ COMPOSEFILE
       exit 1
     fi
     LOAD_START=\$SECONDS
-    docker load -i $TAR_FILE
+    \$DCMD load -i $TAR_FILE
     echo "  Load time: \$((SECONDS - LOAD_START))s"
 
     echo ""
     echo "  ── R5: Available images ────────────────────────────────"
-    docker images | grep -E "REPOSITORY|$IMAGE_NAME" | sed 's/^/  /'
+    \$DCMD images | grep -E "REPOSITORY|$IMAGE_NAME" | sed 's/^/  /'
 
     echo ""
     echo "  ── R6: Starting services ───────────────────────────────"
-    docker compose up -d
+    \$DCMD compose up -d
 
     echo ""
     echo "  ── R7: Waiting for containers (8s) ─────────────────────"
@@ -648,27 +677,27 @@ COMPOSEFILE
 
     echo ""
     echo "  ── R8: Container status ────────────────────────────────"
-    docker compose ps 2>&1 | sed 's/^/  /'
+    \$DCMD compose ps 2>&1 | sed 's/^/  /'
 
     echo ""
     echo "  ── R9: Verifying containers are running ────────────────"
-    RUNNING=\$(docker compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
+    RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after startup."
       echo ""
       echo "  ── Last 50 log lines ───────────────────────────────────"
-      docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
+      \$DCMD compose logs --tail=50 2>&1 | sed 's/^/  /' || true
       exit 1
     fi
     echo "  Running containers: \$RUNNING"
 
     echo ""
     echo "  ── R10: Last 20 log lines ──────────────────────────────"
-    docker compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
+    \$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
 
     echo ""
     echo "  ── R11: Cleaning old images ────────────────────────────"
-    docker image prune -f 2>&1 | sed 's/^/  /'
+    \$DCMD image prune -f 2>&1 | sed 's/^/  /'
 
     echo ""
     echo "  ── R12: Final disk usage ───────────────────────────────"
@@ -707,46 +736,55 @@ do_restart() {
 
   remote bash << REMOTE
     set -eo pipefail
+
+    # ── Detect whether docker needs sudo ─────────────────────────────────────
+    if groups | grep -q docker 2>/dev/null; then
+      DCMD="docker"
+    else
+      DCMD="sudo docker"
+    fi
+    echo "  [REMOTE] Docker command: \$DCMD"
+
     cd $SERVER_PATH
 
     echo "  ── Stopping containers ─────────────────────────────────"
-    docker compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
+    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
 
     echo ""
     echo "  ── Removing known containers ───────────────────────────"
-    docker rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
+    \$DCMD rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
 
     echo ""
     echo "  ── Checking port $APP_PORT ──────────────────────────────"
-    CONFLICTING=\$(docker ps -q --filter "publish=$APP_PORT")
+    CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT")
     if [ -n "\$CONFLICTING" ]; then
-      docker rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
+      \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
     else
       echo "  No port conflicts"
     fi
 
     echo ""
     echo "  ── Starting services ───────────────────────────────────"
-    docker compose up -d
+    \$DCMD compose up -d
 
     echo ""
     sleep 8
     echo "  ── Verifying containers are running ────────────────────"
-    RUNNING=\$(docker compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
+    RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c " Up \| running " || true; })
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after restart."
-      docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
+      \$DCMD compose logs --tail=50 2>&1 | sed 's/^/  /' || true
       exit 1
     fi
     echo "  Running containers: \$RUNNING"
 
     echo ""
     echo "  ── Container status ────────────────────────────────────"
-    docker compose ps 2>&1 | sed 's/^/  /'
+    \$DCMD compose ps 2>&1 | sed 's/^/  /'
 
     echo ""
     echo "  ── Last 20 log lines ───────────────────────────────────"
-    docker compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
+    \$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
 REMOTE
   REMOTE_EXIT=$?
 
@@ -765,11 +803,18 @@ do_stop() {
   check_ssh
   step_start "Stopping all containers..."
   remote bash << REMOTE
+    # ── Detect whether docker needs sudo ─────────────────────────────────────
+    if groups | grep -q docker 2>/dev/null; then
+      DCMD="docker"
+    else
+      DCMD="sudo docker"
+    fi
+
     cd $SERVER_PATH
-    docker compose down --remove-orphans 2>&1 | sed 's/^/  /'
+    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /'
     echo ""
     echo "  ── Remaining containers ────────────────────────────────"
-    docker ps 2>&1 | sed 's/^/  /'
+    \$DCMD ps 2>&1 | sed 's/^/  /'
 REMOTE
   step_ok "All containers stopped"
 }
@@ -779,7 +824,14 @@ do_logs() {
   print_header "Logs from $SERVER_IP"
   check_ssh
   printf "${DIM}  Tailing logs... Ctrl+C to exit${NC}\n\n"
-  remote "cd $SERVER_PATH && docker compose logs -f app"
+  remote bash << REMOTE
+    if groups | grep -q docker 2>/dev/null; then
+      DCMD="docker"
+    else
+      DCMD="sudo docker"
+    fi
+    cd $SERVER_PATH && \$DCMD compose logs -f app
+REMOTE
 }
 
 # ── Local ─────────────────────────────────────────────────────────────────────
