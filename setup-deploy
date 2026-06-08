@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── setup-deploy ──────────────────────────────────────────────────────────────
-# Version: 2.1.0
+# Version: 2.2.0
 # Usage:
 #   setup-deploy                  → setup new project
 #   setup-deploy --install        → first time install on this Mac
@@ -9,8 +9,18 @@
 #   setup-deploy --fix            → auto-fix image name mismatch between
 #                                   deploy.config.sh and docker-compose.yml
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# IMPORTANT — why this file uses a main() wrapper:
+# When --update runs, it overwrites THIS file on disk via mv. Bash reads
+# scripts in ~4 KB chunks at seek offsets. Without the wrapper, bash would
+# read the next chunk from the NEW file at the OLD offset and execute garbage.
+# Wrapping everything in main() + calling it at the very last line forces bash
+# to parse the entire file into memory before executing a single statement.
+# ─────────────────────────────────────────────────────────────────────────────
 
-DEPLOY_VERSION="2.1.0"
+main() {
+
+DEPLOY_VERSION="2.2.0"
 GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
 DEPLOY_DIR="$HOME/.deploy"
 
@@ -230,10 +240,6 @@ do_update() {
   printf "\n"
   success "Update complete!"
   printf "\n"
-  # Exit immediately — the current script file was just replaced on disk.
-  # If bash reads the next chunk from the new file at the old offset it will
-  # execute garbage. Exiting here ensures only the old in-memory code runs.
-  exit 0
 }
 
 # ── Update secrets ────────────────────────────────────────────────────────────
@@ -672,3 +678,9 @@ case "${1:-setup}" in
     exit 1
     ;;
 esac
+
+} # end main()
+
+# Calling main() as the very last line forces bash to parse the entire file
+# into memory before executing anything — safe for self-replacing scripts.
+main "$@"
