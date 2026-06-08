@@ -612,7 +612,6 @@ do_push() {
     echo ""
     echo "  ── R6: Starting services ───────────────────────────────"
     docker compose up -d
-    echo "  docker compose up -d exited \$?"
 
     echo ""
     echo "  ── R7: Waiting for containers (8s) ─────────────────────"
@@ -624,7 +623,7 @@ do_push() {
 
     echo ""
     echo "  ── R9: Verifying containers are running ────────────────"
-    RUNNING=\$(docker compose ps --services --filter "status=running" 2>/dev/null | wc -l | tr -d ' ')
+    RUNNING=\$(docker compose ps 2>/dev/null | grep -c " Up \| running " || echo 0)
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after startup."
       echo ""
@@ -704,7 +703,7 @@ do_restart() {
     echo ""
     sleep 8
     echo "  ── Verifying containers are running ────────────────────"
-    RUNNING=\$(docker compose ps --services --filter "status=running" 2>/dev/null | wc -l | tr -d ' ')
+    RUNNING=\$(docker compose ps 2>/dev/null | grep -c " Up \| running " || echo 0)
     if [ "\$RUNNING" -eq 0 ]; then
       echo "  ERROR: No containers are running after restart."
       docker compose logs --tail=50 2>&1 | sed 's/^/  /' || true
