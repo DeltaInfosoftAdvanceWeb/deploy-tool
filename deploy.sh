@@ -1,26 +1,33 @@
 #!/bin/bash
+
 # ── Universal Next.js Deploy Script ──────────────────────────────────────────
-# Version: 2.3.0
-# Changes from 2.2.0:
-#   - Rollback: old image saved as :rollback before loading new one
-#   - Rollback: if new container fails health, old image is restored automatically
-#   - Startup wait: replaced hardcoded sleep 8 with health-poll loop (max 60s)
-#   - Startup wait: same fix applied in do_restart
-#   - Tar cleanup: tar file deleted from server after successful image load
+# Version: 3.0.0
+#
+# Changes from 2.3.1:
+#   - FIX: R2 removed (was dead code — wrong container names, never matched)
+#   - FIX: Local tar file deleted after successful upload (was never cleaned up)
+#   - NEW: ./deploy.sh rollback — manually restore :rollback image anytime
+#   - FIX: Startup wait replaced hardcoded 30s sleep with 2s polling (max 60s)
+#   - FIX: Real health check — hits http://localhost:PORT not just "is Up?"
+#   - FIX: macOS Keychain falls back to .secrets file (works on Linux/CI too)
+#   - NEW: Clients stored in deploy.config.sh (not .env) with multiple URLs
+#   - FIX: All errors clearly labelled with WHAT failed and WHY — no silent failures
+#
 # Usage:
-#   ./deploy.sh                        → build image + export tar
-#   ./deploy.sh push                   → build + upload + restart
-#   ./deploy.sh push --client GCKC     → deploy for specific client
-#   ./deploy.sh restart                → just restart on server
-#   ./deploy.sh stop                   → stop everything on server
-#   ./deploy.sh logs                   → tail server logs
-#   ./deploy.sh local                  → run locally for testing
-#   ./deploy.sh client --list          → list all clients in .env
-#   ./deploy.sh client --add           → add new client to .env
-#   ./deploy.sh client --remove NAME   → remove client from .env
+#   ./deploy.sh           → build image + export tar (local only)
+#   ./deploy.sh push      → build + upload + restart on server
+#   ./deploy.sh push --client GCKC → deploy for specific client
+#   ./deploy.sh restart   → just restart containers on server
+#   ./deploy.sh rollback  → restore previous :rollback image on server
+#   ./deploy.sh stop      → stop everything on server
+#   ./deploy.sh logs      → tail server logs
+#   ./deploy.sh local     → run locally for testing
+#   ./deploy.sh client --list        → list all clients in deploy.config.sh
+#   ./deploy.sh client --add         → add new client to deploy.config.sh
+#   ./deploy.sh client --remove NAME → remove client from deploy.config.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPLOY_VERSION="2.3.1"
+DEPLOY_VERSION="3.0.0"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -34,27 +41,28 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 STEP_START=0
-ts()         { date '+%H:%M:%S'; }
-elapsed()    { echo "$((SECONDS - STEP_START))s"; }
+ts()      { date '+%H:%M:%S'; }
+elapsed() { echo "$((SECONDS - STEP_START))s"; }
+
 step_start() { STEP_START=$SECONDS; printf "${CYAN}[$(ts)]${NC} ${BOLD}▶ %s${NC}\n" "$1"; }
 step_ok()    { printf "${GREEN}[$(ts)]${NC} ${GREEN}✅ %s${NC} ${DIM}($(elapsed))${NC}\n\n" "$1"; }
 step_warn()  { printf "${YELLOW}[$(ts)]${NC} ${YELLOW}⚠️  %s${NC}\n" "$1"; }
 step_err()   { printf "${RED}[$(ts)]${NC} ${RED}❌ %s${NC}\n" "$1"; }
-info()       { printf "${DIM}[$(ts)]   %s${NC}\n" "$1"; }
+info()       { printf "${DIM}[$(ts)] %s${NC}\n" "$1"; }
 
 print_header() {
   printf "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"
-  printf "${BOLD}${BLUE}  %s — %s${NC}\n" "$APP_NAME" "$1"
+  printf "${BOLD}${BLUE} %s — %s${NC}\n" "$APP_NAME" "$1"
   printf "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"
-  printf "${DIM}  Version : %s${NC}\n" "$DEPLOY_VERSION"
-  printf "${DIM}  Started : %s${NC}\n\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf "${DIM} Version : %s${NC}\n" "$DEPLOY_VERSION"
+  printf "${DIM} Started : %s${NC}\n\n" "$(date '+%Y-%m-%d %H:%M:%S')"
 }
 
-print_divider() { printf "${DIM}  ──────────────────────────────────────────${NC}\n"; }
+print_divider() { printf "${DIM} ──────────────────────────────────────────${NC}\n"; }
 
 print_summary() {
   printf "\n${BOLD}${MAGENTA}══════════════════════════════════════════${NC}\n"
-  printf "${BOLD}${MAGENTA}  Summary${NC}\n"
+  printf "${BOLD}${MAGENTA} Summary${NC}\n"
   printf "${BOLD}${MAGENTA}══════════════════════════════════════════${NC}\n"
 }
 
@@ -81,25 +89,51 @@ if [ -f "docker-compose.yml" ]; then
   IMAGE_NAME=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 \
     | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'")
 fi
+
 if [ -z "$IMAGE_NAME" ]; then
   printf "${RED}❌ No 'image:' line found in docker-compose.yml.${NC}\n"
-  printf "   Add one to your service, e.g.:  image: myapp\n"
+  printf "   Add one to your service, e.g.: image: myapp\n"
   printf "   Or run: setup-deploy --fix\n"
   exit 1
 fi
 
-# ── Load server password from Keychain ───────────────────────────────────────
-SERVER_PASS=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
+# ── Load server password ──────────────────────────────────────────────────────
+# Tries macOS Keychain first, falls back to .secrets file (Linux/CI compatible)
+_load_server_pass() {
+  local pass=""
+
+  # macOS Keychain
+  if command -v security &>/dev/null; then
+    pass=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
+  fi
+
+  # Fallback: .secrets file (chmod 600 recommended)
+  if [ -z "$pass" ] && [ -f "$(dirname "$0")/.secrets" ]; then
+    pass=$(grep -E '^SERVER_PASS=' "$(dirname "$0")/.secrets" | head -1 | sed 's/SERVER_PASS=//' | tr -d '"'"'" | tr -d "'")
+  fi
+
+  # Fallback: env variable (CI/CD)
+  if [ -z "$pass" ] && [ -n "$DEPLOY_SERVER_PASS" ]; then
+    pass="$DEPLOY_SERVER_PASS"
+  fi
+
+  echo "$pass"
+}
+
+SERVER_PASS=$(_load_server_pass)
+
 if [ -z "$SERVER_PASS" ]; then
-  printf "${RED}❌ Server password not found in Keychain.${NC}\n"
-  printf "   Fix: cd your-project && setup-deploy --update-secrets\n"
+  printf "${RED}❌ Server password not found.${NC}\n"
+  printf "   Tried: macOS Keychain → .secrets file → DEPLOY_SERVER_PASS env var\n"
+  printf "   Fix (macOS): cd your-project && setup-deploy --update-secrets\n"
+  printf "   Fix (Linux): echo 'SERVER_PASS=yourpassword' > .secrets && chmod 600 .secrets\n"
+  printf "   Fix (CI):    export DEPLOY_SERVER_PASS=yourpassword\n"
   exit 1
 fi
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 CMD="${1:-build}"
 CLIENT_NAME=""
-
 for i in "$@"; do
   if [ "$i" = "--client" ]; then
     shift
@@ -111,21 +145,33 @@ done
 # ── SSH helpers ───────────────────────────────────────────────────────────────
 remote() {
   if command -v sshpass &>/dev/null && [ -n "$SERVER_PASS" ]; then
-    sshpass -p "$SERVER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$SERVER_USER@$SERVER_IP" "$@"
+    sshpass -p "$SERVER_PASS" ssh \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      "$SERVER_USER@$SERVER_IP" "$@"
   else
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$SERVER_USER@$SERVER_IP" "$@"
+    ssh \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      "$SERVER_USER@$SERVER_IP" "$@"
   fi
 }
 
 push_file_progress() {
   local src="$1"
   local dst="$2"
-  local filename=$(basename "$src")
-  local filesize=$(du -sh "$src" 2>/dev/null | cut -f1)
+  local filename
+  filename=$(basename "$src")
+  local filesize
+  filesize=$(du -sh "$src" 2>/dev/null | cut -f1)
 
-  info "  File   : $filename"
-  info "  Size   : $filesize"
-  info "  Dest   : $SERVER_USER@$SERVER_IP:$dst"
+  info "  File : $filename"
+  info "  Size : $filesize"
+  info "  Dest : $SERVER_USER@$SERVER_IP:$dst"
   printf "\n"
 
   local TRANSFER_START=$SECONDS
@@ -136,41 +182,50 @@ push_file_progress() {
       sshpass -p "$SERVER_PASS" rsync -avz --checksum --progress \
         -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
         "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
-        step_err "Failed to transfer $filename"
-        printf "   Check: server is reachable, disk space is available, path exists\n"
-        exit 1
-      }
+          step_err "TRANSFER FAILED: Could not upload $filename"
+          printf "   Reason: rsync exited with error\n"
+          printf "   Check: server reachable, disk space available, path exists\n"
+          exit 1
+        }
     else
       rsync -avz --checksum --progress \
         -e "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
         "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
-        step_err "Failed to transfer $filename"
-        exit 1
-      }
+          step_err "TRANSFER FAILED: Could not upload $filename"
+          printf "   Check: SSH keys configured, server reachable\n"
+          exit 1
+        }
     fi
   else
     info "rsync not found — using scp..."
     if command -v sshpass &>/dev/null && [ -n "$SERVER_PASS" ]; then
-      sshpass -p "$SERVER_PASS" scp -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=15 "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
-        step_err "Failed to transfer $filename via scp"
-        exit 1
-      }
+      sshpass -p "$SERVER_PASS" scp \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=15 \
+        "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
+          step_err "TRANSFER FAILED: scp could not upload $filename"
+          printf "   Fix: brew install hudochenkov/sshpass/sshpass\n"
+          exit 1
+        }
     else
-      scp -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=15 "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
-        step_err "Failed to transfer $filename via scp"
-        exit 1
-      }
+      scp \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=15 \
+        "$src" "$SERVER_USER@$SERVER_IP:$dst" || {
+          step_err "TRANSFER FAILED: scp could not upload $filename"
+          exit 1
+        }
     fi
   fi
 
   local transfer_elapsed=$((SECONDS - TRANSFER_START))
-  local bytes=$(file_bytes "$src")
+  local bytes
+  bytes=$(file_bytes "$src")
   local speed=0
   if [ "$transfer_elapsed" -gt 0 ] && [ "$bytes" -gt 0 ]; then
     speed=$(( bytes / transfer_elapsed / 1024 ))
   fi
+
   info "  Transfer time : ${transfer_elapsed}s"
   [ "$speed" -gt 0 ] && info "  Avg speed     : ${speed} KB/s"
 }
@@ -180,91 +235,141 @@ check_ssh() {
   if remote "echo 'SSH OK'" 2>&1; then
     step_ok "SSH connection successful"
   else
-    step_err "Cannot connect to $SERVER_IP"
+    step_err "SSH CONNECTION FAILED: Cannot connect to $SERVER_IP"
     printf "   Possible reasons:\n"
-    printf "   - Wrong IP address: %s\n" "$SERVER_IP"
-    printf "   - Wrong username: %s\n" "$SERVER_USER"
-    printf "   - Wrong password (update with: setup-deploy --update-secrets)\n"
-    printf "   - Server is offline or unreachable\n"
+    printf "   - Wrong IP address   : %s\n" "$SERVER_IP"
+    printf "   - Wrong username     : %s\n" "$SERVER_USER"
+    printf "   - Wrong password     → run: setup-deploy --update-secrets\n"
+    printf "   - Server is offline\n"
     printf "   - SSH port blocked by firewall\n"
     exit 1
   fi
 }
 
-# ── Validate docker-compose.yml has a ports: mapping ─────────────────────────
+# ── Validate docker-compose.yml has ports mapping ─────────────────────────────
 check_compose_ports() {
   if ! grep -qE 'ports:' docker-compose.yml; then
     step_warn "No 'ports:' section found in docker-compose.yml"
-    printf "   Without a ports mapping the app will not be accessible.\n"
-    printf "   Expected something like:\n"
-    printf "       ports:\n"
-    printf "         - \"%s:3000\"\n" "$APP_PORT"
+    printf "   Without a ports mapping the app will not be accessible from outside.\n"
+    printf "   Expected:\n"
+    printf "     ports:\n"
+    printf "       - \"%s:3000\"\n" "$APP_PORT"
     printf "   Continue anyway? (y/N): " >&2
     read _compose_confirm
     if [ "$_compose_confirm" != "y" ] && [ "$_compose_confirm" != "Y" ]; then
-      printf "  Aborted. Fix docker-compose.yml and try again.\n"
+      printf "   Aborted. Fix docker-compose.yml and try again.\n"
       exit 1
     fi
   fi
 }
 
-# ── Client management helpers ─────────────────────────────────────────────────
-get_env_clients() {
-  grep -E '^#?\s*CLIENT_ID=' .env 2>/dev/null | \
-    sed 's/^#\s*//' | \
-    sed 's/CLIENT_ID=//' | \
-    sed 's/#.*//' | \
-    tr -d ' ' | \
-    sort -u
+# ── Client helpers — read from deploy.config.sh ───────────────────────────────
+
+# Returns space-separated list of client names defined in config
+get_config_clients() {
+  echo "${API_CLIENTS:-}"
 }
 
-get_client_url() {
+# Returns the URL array var name for a client: CLIENT_GCKC_URLS
+_client_urls_var() {
+  echo "CLIENT_$1_URLS"
+}
+
+# Returns the ID var name for a client: CLIENT_GCKC_ID
+_client_id_var() {
+  echo "CLIENT_$1_ID"
+}
+
+# Get all URL lines for a client (from array in config)
+get_client_urls() {
   local client="$1"
-  grep -n -E "^#?\s*CLIENT_ID=\s*${client}\s*$" .env 2>/dev/null | head -1 | while IFS=: read -r lineno rest; do
-    if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
-      url_line=$(sed -n "$((lineno-1))p" .env)
-      echo "$url_line" | sed 's/^#\s*//' | sed 's/NEXT_PUBLIC_API_BASE_URL=//' | sed 's/#.*//' | tr -d ' '
-    fi
+  local var
+  var=$(_client_urls_var "$client")
+  # eval the array from config (already sourced)
+  eval "local urls=(\"\${${var}[@]}\")"
+  for url in "${urls[@]}"; do
+    echo "$url"
   done
 }
 
+# Get client ID (optional)
+get_client_id() {
+  local client="$1"
+  local var
+  var=$(_client_id_var "$client")
+  eval "echo \"\${${var}:-}\""
+}
+
+# Build a temp .env with client URLs injected (replaces matching keys, appends new ones)
 build_client_env() {
   local client="$1"
-  local env_file=".env"
-  local tmp_env=$(mktemp)
+  local base_env=".env"
 
-  local client_url
-  client_url=$(get_client_url "$client")
-
-  if [ -z "$client_url" ]; then
-    step_err "Client '$client' not found in .env"
-    printf "   Run: ./deploy.sh client --list   to see available clients\n"
-    rm -f "$tmp_env"
+  if [ ! -f "$base_env" ]; then
+    step_err "BUILD CLIENT ENV FAILED: .env file not found"
+    printf "   Create a .env file in your project root first\n"
     exit 1
   fi
 
-  grep -vE '^#?\s*(NEXT_PUBLIC_API_BASE_URL|CLIENT_ID)=' "$env_file" | \
-    grep -v '^#.*#' | \
-    sed 's/[[:space:]]*#[^=]*$//' \
-    > "$tmp_env"
+  local client_id
+  client_id=$(get_client_id "$client")
 
-  printf "\nNEXT_PUBLIC_API_BASE_URL=%s\n" "$client_url" >> "$tmp_env"
-  printf "CLIENT_ID=%s\n" "$client" >> "$tmp_env"
+  # Collect client URL lines
+  local url_lines=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && url_lines+=("$line")
+  done < <(get_client_urls "$client")
+
+  if [ ${#url_lines[@]} -eq 0 ]; then
+    step_err "BUILD CLIENT ENV FAILED: No URLs found for client '$client'"
+    printf "   Run: ./deploy.sh client --list to check defined clients\n"
+    exit 1
+  fi
+
+  # Build list of keys defined for this client
+  local client_keys=()
+  for line in "${url_lines[@]}"; do
+    local key
+    key=$(echo "$line" | cut -d'=' -f1)
+    client_keys+=("$key")
+  done
+  [ -n "$client_id" ] && client_keys+=("CLIENT_ID")
+
+  # Start with base .env, stripping lines whose keys will be replaced
+  local tmp_env
+  tmp_env=$(mktemp)
+
+  while IFS= read -r line; do
+    local skip=0
+    for key in "${client_keys[@]}"; do
+      if echo "$line" | grep -qE "^[[:space:]]*${key}[[:space:]]*="; then
+        skip=1; break
+      fi
+    done
+    [ "$skip" -eq 0 ] && echo "$line"
+  done < "$base_env" > "$tmp_env"
+
+  # Append client-specific URLs
+  printf "\n# ── Client: %s ──\n" "$client" >> "$tmp_env"
+  for line in "${url_lines[@]}"; do
+    echo "$line" >> "$tmp_env"
+  done
+
+  # Append CLIENT_ID if set
+  if [ -n "$client_id" ]; then
+    echo "CLIENT_ID=${client_id}" >> "$tmp_env"
+  fi
 
   echo "$tmp_env"
 }
 
-# ── Client commands ───────────────────────────────────────────────────────────
+# ── Client management ─────────────────────────────────────────────────────────
+
 do_client_list() {
-  if [ ! -f ".env" ]; then
-    step_err "No .env file found in current directory"
-    exit 1
-  fi
-
-  printf "\n${BOLD}${CYAN}  Available clients in .env:${NC}\n\n"
-
   local clients
-  clients=$(get_env_clients)
+  clients=$(get_config_clients)
+
+  printf "\n${BOLD}${CYAN} Clients defined in deploy.config.sh:${NC}\n\n"
 
   if [ -z "$clients" ]; then
     printf "  ${DIM}No clients found. Add one with: ./deploy.sh client --add${NC}\n\n"
@@ -272,62 +377,135 @@ do_client_list() {
   fi
 
   local i=1
-  while IFS= read -r client; do
-    local url
-    url=$(get_client_url "$client")
-    printf "  ${BOLD}%d. %-15s${NC} ${DIM}→ %s${NC}\n" "$i" "$client" "$url"
+  for client in $clients; do
+    local client_id
+    client_id=$(get_client_id "$client")
+    printf "  ${BOLD}%d. %s${NC}%s\n" "$i" "$client" \
+      "${client_id:+  (ID: $client_id)}"
+
+    while IFS= read -r url_line; do
+      printf "     ${DIM}%s${NC}\n" "$url_line"
+    done < <(get_client_urls "$client")
+
+    printf "\n"
     i=$((i+1))
-  done <<< "$clients"
-  printf "\n"
+  done
 }
 
 do_client_add() {
-  if [ ! -f ".env" ]; then
-    step_err "No .env file found in current directory"
-    exit 1
-  fi
+  printf "\n${BOLD}${CYAN} Add New Client${NC}\n\n"
 
-  printf "\n${BOLD}${CYAN}  Add New Client${NC}\n\n"
-
+  # Client name
+  local client_name=""
   while true; do
-    printf "  ? Client name (e.g. GCKC, DARA, Samarth): " >&2
+    printf "  ? Client name (e.g. GCKC, DARA): " >&2
     read client_name
     if [ -z "$client_name" ]; then
-      printf "  ❌ Client name cannot be empty.\n" >&2
-      continue
+      printf "  ${RED}❌ Client name cannot be empty.${NC}\n" >&2; continue
     fi
     if ! echo "$client_name" | grep -qE '^[a-zA-Z0-9_-]+$'; then
-      printf "  ❌ No spaces or special characters allowed.\n" >&2
-      continue
+      printf "  ${RED}❌ No spaces or special characters allowed.${NC}\n" >&2; continue
     fi
-    if get_env_clients | grep -qx "$client_name"; then
-      printf "  ❌ Client '%s' already exists.\n" "$client_name" >&2
-      continue
+    local existing
+    existing=$(get_config_clients)
+    if echo "$existing" | grep -qw "$client_name"; then
+      printf "  ${RED}❌ Client '%s' already exists.${NC}\n" "$client_name" >&2; continue
     fi
     break
   done
 
+  # Multiple URLs
+  printf "\n  ${DIM}Paste your .env URL lines one by one (KEY=VALUE format).${NC}\n"
+  printf "  ${DIM}Press Enter on a blank line when done.${NC}\n"
+  printf "  ${DIM}Example:${NC}\n"
+  printf "  ${DIM}  NEXT_PUBLIC_API_BASE_URL=http://delta.gckc.com:901/api${NC}\n"
+  printf "  ${DIM}  NEXT_PUBLIC_AUTH_URL=http://delta.gckc.com${NC}\n\n"
+
+  local url_lines=()
+  local url_count=0
   while true; do
-    printf "  ? API Base URL for %s: " "$client_name" >&2
-    read client_url
-    if [ -z "$client_url" ]; then
-      printf "  ❌ URL cannot be empty.\n" >&2
+    printf "  URL line %d (blank to finish): " "$((url_count+1))" >&2
+    local url_line=""
+    read url_line
+
+    # Blank line = done
+    if [ -z "$url_line" ]; then
+      if [ ${#url_lines[@]} -eq 0 ]; then
+        printf "  ${RED}❌ At least one URL is required.${NC}\n" >&2
+        continue
+      fi
+      break
+    fi
+
+    # Must be KEY=VALUE
+    if ! echo "$url_line" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=.+'; then
+      printf "  ${RED}❌ Must be in KEY=VALUE format. Example: NEXT_PUBLIC_API_BASE_URL=http://...${NC}\n" >&2
       continue
     fi
-    if ! echo "$client_url" | grep -qE '^https?://'; then
-      printf "  ❌ URL must start with http:// or https://\n" >&2
-      printf "     You entered: %s\n" "$client_url" >&2
+
+    # Value must start with http
+    local url_val
+    url_val=$(echo "$url_line" | cut -d'=' -f2-)
+    if ! echo "$url_val" | grep -qE '^https?://'; then
+      printf "  ${RED}❌ URL value must start with http:// or https://. You entered: %s${NC}\n" "$url_val" >&2
       continue
     fi
-    break
+
+    url_lines+=("$url_line")
+    url_count=$((url_count+1))
+    printf "  ${GREEN}✅ Added${NC}\n" >&2
   done
 
-  printf "\n# NEXT_PUBLIC_API_BASE_URL=%s  # for %s\n# CLIENT_ID=%s\n" \
-    "$client_url" "$client_name" "$client_name" >> .env
+  # Optional Client ID
+  printf "\n  ? Client ID for %s (optional, press Enter to skip): " "$client_name" >&2
+  local client_id=""
+  read client_id
 
-  printf "\n"
-  success() { printf "${GREEN}  ✅ %s${NC}\n" "$1"; }
-  success "Client '$client_name' added to .env (commented by default)"
+  # Preview
+  printf "\n  ${BOLD}Preview for %s:${NC}\n" "$client_name"
+  for line in "${url_lines[@]}"; do
+    printf "  ${DIM}%s${NC}\n" "$line"
+  done
+  [ -n "$client_id" ] && printf "  ${DIM}CLIENT_ID=%s${NC}\n" "$client_id"
+
+  printf "\n  Confirm add? (y/N): " >&2
+  local confirm=""
+  read confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    printf "  Aborted.\n\n"; return
+  fi
+
+  # Write to deploy.config.sh
+  local config_file
+  config_file="$(dirname "$0")/deploy.config.sh"
+
+  # Update API_CLIENTS list
+  local existing_clients
+  existing_clients=$(get_config_clients)
+  local new_clients="${existing_clients:+$existing_clients }${client_name}"
+
+  # Build URLs array block
+  local array_block
+  array_block="CLIENT_${client_name}_URLS=(\n"
+  for line in "${url_lines[@]}"; do
+    array_block+="  \"${line}\"\n"
+  done
+  array_block+=")"
+
+  # Append to config
+  {
+    printf "\n# ── Client: %s ──────────────────────────────────────────\n" "$client_name"
+    printf "%b\n" "$array_block"
+    printf "CLIENT_%s_ID=\"%s\"\n" "$client_name" "$client_id"
+  } >> "$config_file"
+
+  # Update API_CLIENTS= line in config
+  local tmp
+  tmp=$(mktemp)
+  sed "s/^API_CLIENTS=.*/API_CLIENTS=\"${new_clients}\"/" "$config_file" > "$tmp"
+  mv "$tmp" "$config_file"
+
+  printf "\n${GREEN}  ✅ Client '%s' added to deploy.config.sh${NC}\n" "$client_name"
   printf "  ${DIM}Deploy with: ./deploy.sh push --client %s${NC}\n\n" "$client_name"
 }
 
@@ -338,196 +516,57 @@ do_client_remove() {
     exit 1
   fi
 
-  if [ ! -f ".env" ]; then
-    step_err "No .env file found"
-    exit 1
-  fi
-
-  if ! get_env_clients | grep -qx "$client"; then
-    step_err "Client '$client' not found in .env"
+  local existing
+  existing=$(get_config_clients)
+  if ! echo "$existing" | grep -qw "$client"; then
+    step_err "REMOVE FAILED: Client '$client' not found in deploy.config.sh"
     do_client_list
     exit 1
   fi
 
-  printf "\n  ${YELLOW}⚠️  Remove client '%s' from .env?${NC}\n" "$client"
-  printf "  This will permanently delete its URL and CLIENT_ID lines.\n"
+  printf "\n  ${YELLOW}⚠️  Remove client '%s' from deploy.config.sh?${NC}\n" "$client"
+  printf "  This will permanently delete its URL block and ID.\n"
   printf "  Confirm? (y/N): " >&2
+  local confirm=""
   read confirm
   if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    printf "  Aborted.\n\n"
-    exit 0
+    printf "  Aborted.\n\n"; exit 0
   fi
 
+  local config_file
+  config_file="$(dirname "$0")/deploy.config.sh"
   local tmp
   tmp=$(mktemp)
+
+  # Remove the client block (comment header + URLS array + ID line)
   awk -v client="$client" '
-    /^#?[[:space:]]*(NEXT_PUBLIC_API_BASE_URL)[[:space:]]*=/ {
-      pending = $0
-      next
-    }
-    /^#?[[:space:]]*CLIENT_ID[[:space:]]*=[[:space:]]*/ {
-      if (index($0, client) > 0) {
-        pending = ""
-        next
-      } else {
-        if (pending != "") { print pending; pending = "" }
-        print
-        next
-      }
-    }
-    {
-      if (pending != "") { print pending; pending = "" }
-      print
-    }
-  ' .env > "$tmp"
-  mv "$tmp" .env
+    /^# ── Client: / && index($0, client) > 0 { skip=1; next }
+    skip && /^CLIENT_/ && index($0, client) > 0 { next }
+    skip && /^\)/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$config_file" > "$tmp"
 
-  printf "${GREEN}  ✅ Client '%s' removed from .env${NC}\n\n" "$client"
-}
+  # Update API_CLIENTS list
+  local new_clients
+  new_clients=$(echo "$existing" | tr ' ' '\n' | grep -v "^${client}$" | tr '\n' ' ' | xargs)
+  sed -i.bak "s/^API_CLIENTS=.*/API_CLIENTS=\"${new_clients}\"/" "$tmp"
+  rm -f "${tmp}.bak"
 
-
-# ── Pre-flight checks ─────────────────────────────────────────────────────────
-# Runs before every build/push — catches all common issues upfront
-# so deploy never silently hangs
-do_preflight() {
-  printf "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
-  printf "${BOLD}${CYAN}  Pre-flight Checks${NC}\n"
-  printf "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n\n"
-
-  local PASS=0
-  local FAIL=0
-
-  check_pass() { printf "  ${GREEN}✅ %s${NC}\n" "$1"; PASS=$((PASS+1)); }
-  check_fail() { printf "  ${RED}❌ %s${NC}\n" "$1"; printf "     ${DIM}→ %s${NC}\n" "$2"; FAIL=$((FAIL+1)); }
-  check_warn() { printf "  ${YELLOW}⚠️  %s${NC}\n" "$1"; printf "     ${DIM}→ %s${NC}\n" "$2"; }
-
-  # ── 1. Docker Desktop running? ───────────────────────────────────────────
-  printf "  ${DIM}Checking Docker...${NC}\n"
-  if docker info > /dev/null 2>&1; then
-    DOCKER_VER=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
-    check_pass "Docker is running (v$DOCKER_VER)"
-  else
-    check_fail "Docker is NOT running or socket is disconnected"       "Fix: Open Docker Desktop app and wait 30 seconds, then retry"
-    printf "\n  ${RED}Cannot continue without Docker. Exiting.${NC}\n\n"
-    exit 1
-  fi
-
-  # ── 2. Docker buildx available? ──────────────────────────────────────────
-  if docker buildx version > /dev/null 2>&1; then
-    check_pass "Docker buildx available (cross-platform builds supported)"
-  else
-    check_fail "Docker buildx not found"       "Fix: Update Docker Desktop to latest version"
-    exit 1
-  fi
-
-  # ── 3. Dockerfile exists? ────────────────────────────────────────────────
-  if [ -f "Dockerfile" ]; then
-    check_pass "Dockerfile found"
-  else
-    check_fail "Dockerfile not found in current directory"       "Fix: Make sure you are in your project root folder: $(pwd)"
-    exit 1
-  fi
-
-  # ── 4. docker-compose.yml exists? ───────────────────────────────────────
-  if [ -f "docker-compose.yml" ]; then
-    check_pass "docker-compose.yml found"
-  else
-    check_fail "docker-compose.yml not found"       "Fix: Add a docker-compose.yml to your project root"
-    exit 1
-  fi
-
-  # ── 5. Image name in docker-compose.yml? ────────────────────────────────
-  COMPOSE_IMG=$(grep -E "^\s*image\s*:" docker-compose.yml | head -1 | sed "s/.*image\s*:\s*//" | sed "s/:.*//" | tr -d " \"'")
-  if [ -n "$COMPOSE_IMG" ]; then
-    check_pass "Image name found in docker-compose.yml: $COMPOSE_IMG"
-  else
-    check_fail "No 'image:' line in docker-compose.yml"       "Fix: Run: setup-deploy --fix"
-    exit 1
-  fi
-
-  # ── 6. .env file exists? ────────────────────────────────────────────────
-  if [ -f ".env" ]; then
-    check_pass ".env file found"
-  else
-    check_fail ".env file not found"       "Fix: Create a .env file with your environment variables"
-    exit 1
-  fi
-
-  # ── 7. deploy.config.sh exists? ─────────────────────────────────────────
-  CONFIG_FILE="$(dirname "$0")/deploy.config.sh"
-  if [ -f "$CONFIG_FILE" ]; then
-    check_pass "deploy.config.sh found"
-  else
-    check_fail "deploy.config.sh not found"       "Fix: Run: setup-deploy"
-    exit 1
-  fi
-
-  # ── 8. Server password in Keychain? ─────────────────────────────────────
-  _PASS=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
-  if [ -n "$_PASS" ]; then
-    check_pass "Server password found in Keychain"
-  else
-    check_fail "Server password not found in Keychain"       "Fix: Run: setup-deploy --update-secrets"
-    exit 1
-  fi
-
-  # ── 9. Server reachable (ping)? ─────────────────────────────────────────
-  printf "  ${DIM}Checking server reachability...${NC}\n"
-  if ping -c 1 -W 3 "$SERVER_IP" > /dev/null 2>&1; then
-    check_pass "Server $SERVER_IP is reachable"
-  else
-    check_fail "Cannot reach server $SERVER_IP"       "Fix: Check VPN is connected, or server IP is correct ($SERVER_IP)"
-    printf "\n  ${RED}Server unreachable. Is your VPN connected?${NC}\n\n"
-    exit 1
-  fi
-
-  # ── 10. SSH connection works? ────────────────────────────────────────────
-  printf "  ${DIM}Testing SSH connection...${NC}\n"
-  SSH_RESULT=$(sshpass -p "$_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10     "$SERVER_USER@$SERVER_IP" "echo OK" 2>&1)
-  if [ "$SSH_RESULT" = "OK" ]; then
-    check_pass "SSH connection to $SERVER_USER@$SERVER_IP successful"
-  else
-    check_fail "SSH connection failed to $SERVER_USER@$SERVER_IP"       "Fix: Check username/password with: setup-deploy --update-secrets"
-    printf "     ${DIM}Error: %s${NC}\n" "$SSH_RESULT"
-    exit 1
-  fi
-
-  # ── 11. Disk space on Mac (for tar export)? ─────────────────────────────
-  MAC_FREE_GB=$(df -g . 2>/dev/null | awk "NR==2{print \$4}")
-  if [ -n "$MAC_FREE_GB" ] && [ "$MAC_FREE_GB" -ge 2 ] 2>/dev/null; then
-    check_pass "Mac disk space OK (${MAC_FREE_GB}GB free)"
-  else
-    check_warn "Low disk space on Mac (${MAC_FREE_GB}GB free)"       "Need at least 2GB free for tar export"
-  fi
-
-  # ── 12. Disk space on server? ───────────────────────────────────────────
-  SERVER_FREE=$(sshpass -p "$_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10     "$SERVER_USER@$SERVER_IP" "df -m / | awk \"NR==2{print \$4}\"" 2>/dev/null || echo 0)
-  if [ "$SERVER_FREE" -ge 2048 ] 2>/dev/null; then
-    SERVER_FREE_GB=$(( SERVER_FREE / 1024 ))
-    check_pass "Server disk space OK (${SERVER_FREE_GB}GB free)"
-  else
-    check_warn "Low disk space on server (${SERVER_FREE}MB free)"       "Run on server: sudo docker system prune -af"
-  fi
-
-  # ── Summary ──────────────────────────────────────────────────────────────
-  printf "\n${DIM}  ──────────────────────────────────────────${NC}\n"
-  if [ "$FAIL" -eq 0 ]; then
-    printf "  ${GREEN}${BOLD}All checks passed! Starting deploy...${NC}\n\n"
-  else
-    printf "  ${RED}${BOLD}%d check(s) failed. Fix the issues above and retry.${NC}\n\n" "$FAIL"
-    exit 1
-  fi
+  mv "$tmp" "$config_file"
+  printf "${GREEN}  ✅ Client '%s' removed from deploy.config.sh${NC}\n\n" "$client"
 }
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 do_build() {
   local BUILD_TOTAL_START=$SECONDS
-  do_preflight
+
   print_header "Build"
 
   if [ ! -f "Dockerfile" ]; then
-    step_err "Dockerfile not found in current directory"
+    step_err "BUILD FAILED: Dockerfile not found in current directory"
     printf "   Make sure you are running this from your project root folder\n"
+    printf "   Current dir: $(pwd)\n"
     exit 1
   fi
 
@@ -536,118 +575,126 @@ do_build() {
   info "  Platform   : linux/amd64"
   printf "\n"
 
-  local BUILD_DB_URL=""
-  if [ -n "$DB_CLIENTS" ]; then
-    first_client=$(echo "$DB_CLIENTS" | awk '{print $1}')
-    BUILD_DB_URL=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-db-${first_client}-url" -w 2>/dev/null || echo "")
-  else
-    BUILD_DB_URL=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-dburl" -w 2>/dev/null || echo "")
-  fi
+  set -o pipefail
+  docker build --platform linux/amd64 -t "$IMAGE_NAME:latest" . 2>&1 | \
+    while IFS= read -r line; do
+      if echo "$line" | grep -qiE "^(#[0-9]|Step [0-9])"; then
+        printf "  ${CYAN}%s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "error|failed|cannot|denied"; then
+        printf "  ${RED}%s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "warn|warning"; then
+        printf "  ${YELLOW}%s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "successfully|complete|done|cached"; then
+        printf "  ${GREEN}%s${NC}\n" "$line"
+      else
+        printf "  ${DIM}%s${NC}\n" "$line"
+      fi
+    done
 
-  # Direct output — no pipe to avoid Mac buffering issue
-  # BUILDKIT_PROGRESS=plain ensures every step prints immediately
-  DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --progress=plain \
-    -t "$IMAGE_NAME:latest" \
-    ${BUILD_DB_URL:+--build-arg DATABASE_URL="$BUILD_DB_URL"} \
-    .
+  local BUILD_EXIT=$?
   set +o pipefail
 
-  if [ "${BUILD_EXIT:-0}" -ne 0 ]; then
-    step_err "Docker build FAILED (exit $BUILD_EXIT)"
-    printf "   Fix the build error above, then run: ./deploy.sh push\n"
+  if [ $BUILD_EXIT -ne 0 ]; then
+    step_err "BUILD FAILED: docker build exited with code $BUILD_EXIT"
+    printf "   Fix the Dockerfile error shown above, then run: ./deploy.sh push\n"
     exit 1
   fi
+
   step_ok "Docker image built successfully"
 
-  # Show image size quickly without hanging
-  IMG_SIZE=$(docker images "$IMAGE_NAME:latest" --format "{{.Size}}" 2>/dev/null || echo "unknown")
-  IMG_ID=$(docker images "$IMAGE_NAME:latest" --format "{{.ID}}" 2>/dev/null || echo "unknown")
-  info "  Image ID   : $IMG_ID"
-  info "  Image size : $IMG_SIZE"
+  step_start "Checking image details..."
   printf "\n"
+  docker images "$IMAGE_NAME:latest" --format "  ID: {{.ID}}\n  Size: {{.Size}}\n  Created: {{.CreatedAt}}"
+  printf "\n"
+  step_ok "Image info retrieved"
 
   step_start "Exporting image to $TAR_FILE..."
-  info "  This may take 2-4 minutes (compressing image)..."
-  info "  You will see the file size grow below..."
+  info "  This may take 1-3 minutes depending on image size..."
   printf "\n"
 
-  EXPORT_START=$SECONDS
-  # Run export in background and show live file size progress
-  docker save "$IMAGE_NAME:latest" | gzip > "$TAR_FILE" &
-  EXPORT_PID=$!
-  while kill -0 $EXPORT_PID 2>/dev/null; do
-    if [ -f "$TAR_FILE" ]; then
-      CURRENT_SIZE=$(du -sh "$TAR_FILE" 2>/dev/null | cut -f1)
-      printf "\r  ${DIM}  Saving... %s${NC}    " "$CURRENT_SIZE"
-    else
-      printf "\r  ${DIM}  Starting export...${NC}    "
-    fi
-    sleep 2
-  done
-  wait $EXPORT_PID
-  EXPORT_STATUS=$?
-  printf "\n"
-
-  if [ $EXPORT_STATUS -ne 0 ]; then
-    step_err "Failed to export Docker image to $TAR_FILE"
+  local EXPORT_START=$SECONDS
+  docker save "$IMAGE_NAME:latest" | gzip > "$TAR_FILE" || {
+    step_err "EXPORT FAILED: Could not write $TAR_FILE"
     printf "   Check disk space: df -h .\n"
     exit 1
-  fi
-  EXPORT_TIME=$((SECONDS - EXPORT_START))
+  }
+
+  local EXPORT_TIME=$((SECONDS - EXPORT_START))
+  local SIZE
   SIZE=$(du -sh "$TAR_FILE" | cut -f1)
 
-  printf "\n"
-  info "  Output file : $TAR_FILE"
-  info "  File size   : $SIZE"
-  info "  Export time : ${EXPORT_TIME}s"
+  info "  Output file  : $TAR_FILE"
+  info "  File size    : $SIZE"
+  info "  Export time  : ${EXPORT_TIME}s"
   printf "\n"
   step_ok "Image exported successfully"
 
   print_summary
   printf "  ${GREEN}✅ Image built and exported${NC}\n"
-  printf "  ${DIM}   Total build time : %ss${NC}\n\n" "$((SECONDS - BUILD_TOTAL_START))"
-  printf "  To deploy:  ./deploy.sh push\n\n"
+  printf "  ${DIM} Total build time : %ss${NC}\n\n" "$((SECONDS - BUILD_TOTAL_START))"
+  printf "  To deploy: ./deploy.sh push\n\n"
 }
 
 # ── Push ──────────────────────────────────────────────────────────────────────
 do_push() {
   local PUSH_TOTAL_START=$SECONDS
-
   local DEPLOY_CLIENT=""
   local ENV_FILE=".env"
   local CLEAN_ENV_FILE=""
 
   if [ ! -f ".env" ]; then
-    step_err ".env file not found in current directory"
+    step_err "PUSH FAILED: .env file not found in current directory"
     printf "   Create a .env file with your environment variables first\n"
     exit 1
   fi
 
+  # ── Client selection ──────────────────────────────────────────────────────
   local available_clients
-  available_clients=$(get_env_clients)
+  available_clients=$(get_config_clients)
 
   if [ -n "$available_clients" ]; then
     if [ -n "$CLIENT_NAME" ]; then
+      # --client flag passed directly
+      if ! echo "$available_clients" | grep -qw "$CLIENT_NAME"; then
+        step_err "PUSH FAILED: Client '$CLIENT_NAME' not found in deploy.config.sh"
+        printf "   Available clients: %s\n" "$available_clients"
+        printf "   Run: ./deploy.sh client --list\n"
+        exit 1
+      fi
       DEPLOY_CLIENT="$CLIENT_NAME"
     else
-      printf "\n${BOLD}${CYAN}  Available clients found in .env:${NC}\n\n"
+      # Interactive selection
+      printf "\n${BOLD}${CYAN} Available clients in deploy.config.sh:${NC}\n\n"
       local i=1
       local client_list=()
-      while IFS= read -r c; do
-        local curl
-        curl=$(get_client_url "$c")
-        printf "  ${BOLD}%d. %-15s${NC} ${DIM}%s${NC}\n" "$i" "$c" "$curl"
+      for c in $available_clients; do
+        local cid
+        cid=$(get_client_id "$c")
+        printf "  ${BOLD}%d. %s${NC}%s\n" "$i" "$c" "${cid:+  (ID: $cid)}"
+        while IFS= read -r url_line; do
+          printf "     ${DIM}%s${NC}\n" "$url_line"
+        done < <(get_client_urls "$c")
         client_list+=("$c")
         i=$((i+1))
-      done <<< "$available_clients"
+      done
       printf "\n"
       printf "  ? Enter client number or name (or press Enter to deploy as-is): " >&2
+      local client_input=""
       read client_input
 
       if [ -n "$client_input" ]; then
         if echo "$client_input" | grep -qE '^[0-9]+$'; then
           DEPLOY_CLIENT="${client_list[$((client_input-1))]}"
+          if [ -z "$DEPLOY_CLIENT" ]; then
+            step_err "PUSH FAILED: Invalid client number '$client_input'"
+            exit 1
+          fi
         else
+          if ! echo "$available_clients" | grep -qw "$client_input"; then
+            step_err "PUSH FAILED: Client '$client_input' not found"
+            printf "   Available: %s\n" "$available_clients"
+            exit 1
+          fi
           DEPLOY_CLIENT="$client_input"
         fi
       fi
@@ -664,7 +711,10 @@ do_push() {
   print_header "Push to $SERVER_IP${DEPLOY_CLIENT:+ ($DEPLOY_CLIENT)}"
 
   check_compose_ports
+
+  # ── Build ─────────────────────────────────────────────────────────────────
   do_build
+
   print_divider
 
   if ! command -v sshpass &>/dev/null; then
@@ -674,42 +724,67 @@ do_push() {
   fi
 
   check_ssh
+
   print_divider
 
+  # ── Create remote folder ──────────────────────────────────────────────────
   step_start "Creating folder on server: $SERVER_PATH"
   remote "mkdir -p $SERVER_PATH && echo 'Folder ready'" || {
-    step_err "Failed to create folder $SERVER_PATH on server"
-    printf "   Check server path and SSH permissions\n"
+    step_err "REMOTE SETUP FAILED: Could not create $SERVER_PATH on server"
+    printf "   Check SSH permissions and server path\n"
     exit 1
   }
   step_ok "Remote folder ready"
 
-  # ── NEW: Disk space check BEFORE upload ──────────────────────────────────
+  # ── Disk space check ──────────────────────────────────────────────────────
   step_start "Checking remote disk space before upload..."
   printf "\n"
+
+  local LOCAL_TAR_BYTES
   LOCAL_TAR_BYTES=$(file_bytes "$TAR_FILE")
-  LOCAL_TAR_MB=$(( LOCAL_TAR_BYTES / 1024 / 1024 ))
-  info "  Tar file size : ${LOCAL_TAR_MB}MB — need at least $((LOCAL_TAR_MB * 2))MB free on server"
+  local LOCAL_TAR_MB=$(( LOCAL_TAR_BYTES / 1024 / 1024 ))
+  local NEEDED=$(( LOCAL_TAR_MB * 2 ))
+
+  info "  Tar file size : ${LOCAL_TAR_MB}MB — need at least ${NEEDED}MB free on server"
+
+  local REMOTE_FREE
   REMOTE_FREE=$(remote "df -m $SERVER_PATH | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0)
-  NEEDED=$(( LOCAL_TAR_MB * 2 ))
+
   if [ "$REMOTE_FREE" -lt "$NEEDED" ] 2>/dev/null; then
-    step_err "Not enough disk space on server. Free: ${REMOTE_FREE}MB, Need: ${NEEDED}MB"
-    printf "   Free up space on the server before deploying.\n"
+    step_err "DISK SPACE CHECK FAILED: Not enough space on server"
+    printf "   Free : ${REMOTE_FREE}MB\n"
+    printf "   Need : ${NEEDED}MB\n"
+    printf "   Free up space on the server before deploying\n"
+    [ -n "$CLEAN_ENV_FILE" ] && rm -f "$CLEAN_ENV_FILE"
     exit 1
   fi
-  info "  Free space    : ${REMOTE_FREE}MB — OK"
+
+  info "  Free space : ${REMOTE_FREE}MB — OK"
   printf "\n"
   step_ok "Disk space sufficient"
 
   print_divider
+
+  # ── Upload files ──────────────────────────────────────────────────────────
   printf "${BOLD}[$(ts)] Transferring files to server...${NC}\n\n"
 
   step_start "Uploading Docker image tar..."
   push_file_progress "$TAR_FILE" "$SERVER_PATH/"
   step_ok "Docker image tar uploaded"
 
+  # ── FIX: Delete local tar after successful upload ─────────────────────────
+  step_start "Cleaning up local tar file..."
+  rm -f "$TAR_FILE" && {
+    step_ok "Local tar deleted (disk freed on your machine)"
+  } || {
+    step_warn "Could not delete local tar file: $TAR_FILE (not critical)"
+  }
+
+  # ── Generate and upload docker-compose.yml ────────────────────────────────
   step_start "Generating production docker-compose.yml..."
+  local PROD_COMPOSE
   PROD_COMPOSE=$(mktemp /tmp/docker-compose-prod-XXXX.yml)
+
   cat > "$PROD_COMPOSE" << COMPOSEFILE
 services:
   app:
@@ -724,6 +799,7 @@ services:
       - .env
     restart: unless-stopped
 COMPOSEFILE
+
   step_ok "Production docker-compose.yml generated"
 
   step_start "Uploading docker-compose.yml..."
@@ -734,210 +810,341 @@ COMPOSEFILE
   step_start "Uploading .env${DEPLOY_CLIENT:+ (for $DEPLOY_CLIENT)}..."
   push_file_progress "$ENV_FILE" "$SERVER_PATH/.env"
   step_ok ".env uploaded"
-
   [ -n "$CLEAN_ENV_FILE" ] && rm -f "$CLEAN_ENV_FILE"
 
   step_start "Verifying files on server..."
   printf "\n"
   remote "ls -lh $SERVER_PATH/ | awk '{print \"  \"\$0}'" || true
   printf "\n"
-  step_ok "Files verified"
+  step_ok "Files verified on server"
+
   print_divider
 
+  # ── Remote deploy block ───────────────────────────────────────────────────
   printf "${BOLD}[$(ts)] Loading image and restarting on server...${NC}\n\n"
 
-  # ── REMOTE BLOCK — all deploy logic runs on the server ───────────────────
   remote bash << REMOTE
-    set -eo pipefail
+set -eo pipefail
 
-    # ── Detect docker command (sudo or not) ──────────────────────────────────
-    if groups | grep -q docker 2>/dev/null; then
-      DCMD="docker"
+# ── Detect docker command ─────────────────────────────────────────────────
+if groups | grep -q docker 2>/dev/null; then
+  DCMD="docker"
+else
+  DCMD="sudo docker"
+fi
+
+echo "  [REMOTE] Docker command : \$DCMD"
+echo "  [REMOTE] Working path   : $SERVER_PATH"
+echo ""
+
+cd $SERVER_PATH || {
+  echo "  ❌ ERROR: Could not cd into $SERVER_PATH"
+  echo "     The folder may not exist or permissions are wrong"
+  exit 1
+}
+
+# ── R1: Stop existing containers ──────────────────────────────────────────
+echo "  ── R1: Stopping existing containers ─────────────────────────────"
+\$DCMD compose down --remove-orphans 2>&1 | sed 's/^/     /' || true
+echo "  ✅ R1 done"
+echo ""
+
+# NOTE: R2 (docker rm by name) has been removed — it used wrong container
+# names and never matched anything. R1 (compose down) handles cleanup correctly.
+
+# ── R2 (new): Check port conflicts ────────────────────────────────────────
+echo "  ── R2: Checking port $APP_PORT for conflicts ─────────────────────"
+CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT" 2>/dev/null || echo "")
+if [ -n "\$CONFLICTING" ]; then
+  echo "     ⚠️  Found containers using port $APP_PORT — removing them"
+  \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/     /' || true
+else
+  echo "     No port conflicts on $APP_PORT"
+fi
+echo "  ✅ R2 done"
+echo ""
+
+# ── R3: Save current image as :rollback ──────────────────────────────────
+echo "  ── R3: Saving current image as rollback ──────────────────────────"
+ROLLBACK_TAG="${IMAGE_NAME}:rollback"
+ROLLBACK_AVAILABLE=0
+
+if \$DCMD image inspect ${IMAGE_NAME}:latest &>/dev/null 2>&1; then
+  if \$DCMD tag ${IMAGE_NAME}:latest \$ROLLBACK_TAG 2>/dev/null; then
+    echo "     ✅ Saved existing image as \$ROLLBACK_TAG"
+    ROLLBACK_AVAILABLE=1
+  else
+    echo "     ⚠️  Could not tag existing image — rollback not available for this deploy"
+  fi
+else
+  echo "     No existing image found — fresh deploy, rollback not needed"
+fi
+echo ""
+
+# ── R4: Load new Docker image ─────────────────────────────────────────────
+echo "  ── R4: Loading new Docker image ──────────────────────────────────"
+
+TAR_PATH="$SERVER_PATH/$TAR_FILE"
+
+if [ ! -f "\$TAR_PATH" ]; then
+  echo "  ❌ ERROR: Tar file not found at \$TAR_PATH"
+  echo "     The upload may have failed or the filename is wrong"
+  if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
+    echo "  ↩️  Rolling back to previous image..."
+    \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest && \$DCMD compose up -d
+    echo "  ✅ Rollback complete — old version is live again"
+  fi
+  exit 1
+fi
+
+LOAD_START=\$SECONDS
+if ! \$DCMD load -i "\$TAR_PATH" 2>&1 | sed 's/^/     /'; then
+  echo "  ❌ ERROR: docker load failed — image could not be loaded"
+  echo "     The tar file may be corrupted or incomplete"
+  if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
+    echo "  ↩️  Rolling back to previous image..."
+    \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest && \$DCMD compose up -d
+    echo "  ✅ Rollback complete — old version is live again"
+  fi
+  exit 1
+fi
+
+echo "     Load time: \$((SECONDS - LOAD_START))s"
+echo "  ✅ R4 done"
+echo ""
+
+# ── R5: Delete tar from server ────────────────────────────────────────────
+echo "  ── R5: Cleaning up tar from server ───────────────────────────────"
+rm -f "\$TAR_PATH" && echo "     ✅ Tar file deleted (disk freed)" \
+  || echo "     ⚠️  Could not delete tar — remove manually: rm \$TAR_PATH"
+echo ""
+
+# ── R6: Show available images ─────────────────────────────────────────────
+echo "  ── R6: Available images ──────────────────────────────────────────"
+\$DCMD images | grep -E "REPOSITORY|${IMAGE_NAME}" | sed 's/^/     /' || true
+echo ""
+
+# ── R7: Start new containers ──────────────────────────────────────────────
+echo "  ── R7: Starting new containers ───────────────────────────────────"
+if ! \$DCMD compose up -d 2>&1 | sed 's/^/     /'; then
+  echo "  ❌ ERROR: docker compose up failed"
+  echo "     The docker-compose.yml or .env may have errors"
+  if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
+    echo "  ↩️  Rolling back to previous image..."
+    \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
+    \$DCMD compose up -d 2>&1 | sed 's/^/     /'
+    echo "  ✅ Rollback complete — old version is live again"
+  fi
+  exit 1
+fi
+echo "  ✅ R7 done"
+echo ""
+
+# ── R8: Poll for container startup (max 60s, check every 2s) ─────────────
+echo "  ── R8: Waiting for container to start (max 60s) ─────────────────"
+BOOT_START=\$SECONDS
+BOOTED=0
+while [ \$((SECONDS - BOOT_START)) -lt 60 ]; do
+  RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c "Up\|running" || true; })
+  if [ "\$RUNNING" -gt 0 ]; then
+    BOOTED=1
+    break
+  fi
+  echo "     ⏳ \$((SECONDS - BOOT_START))s — waiting..."
+  sleep 2
+done
+
+if [ "\$BOOTED" -eq 0 ]; then
+  echo "  ❌ ERROR: Container did not start within 60 seconds"
+  echo ""
+  echo "  ── Last 50 log lines ────────────────────────────────────────────"
+  \$DCMD compose logs --tail=50 app 2>&1 | sed 's/^/     /' || true
+
+  if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
+    echo ""
+    echo "  ── Rolling back to previous version ─────────────────────────────"
+    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/     /' || true
+    \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
+    if \$DCMD compose up -d 2>&1 | sed 's/^/     /'; then
+      echo "  ✅ Rollback complete — old version is live again"
+      echo "  ⚠️  Fix the issue in your code then deploy again"
     else
-      DCMD="sudo docker"
+      echo "  ❌ Rollback also failed — manual intervention needed"
+      echo "     SSH in and run: docker compose up -d"
     fi
-    echo "  [REMOTE] Docker command: \$DCMD"
-    echo "  [REMOTE] Working in: $SERVER_PATH"
-    cd $SERVER_PATH
+  else
+    echo "  ⚠️  No rollback available (this was a fresh deploy)"
+    echo "     Fix the issue and deploy again"
+  fi
+  exit 1
+fi
 
-    # ── R1: Stop existing containers ─────────────────────────────────────────
-    echo ""
-    echo "  ── R1: Stopping existing containers ───────────────────"
-    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
+echo "     ✅ Container started in \$((SECONDS - BOOT_START))s"
+echo ""
 
-    # ── R2: Remove known leftover containers ─────────────────────────────────
-    echo ""
-    echo "  ── R2: Removing known containers ──────────────────────"
-    \$DCMD rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
+# ── R9: Real health check — hit the actual port ───────────────────────────
+echo "  ── R9: Health check on port $APP_PORT ───────────────────────────"
+HEALTH_START=\$SECONDS
+HEALTHY=0
+for attempt in 1 2 3 4 5; do
+  HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" \
+    --max-time 5 \
+    "http://localhost:$APP_PORT" 2>/dev/null || echo "000")
 
-    # ── R3: Check port conflicts ──────────────────────────────────────────────
-    echo ""
-    echo "  ── R3: Checking port conflicts on $APP_PORT ────────────"
-    CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT")
-    if [ -n "\$CONFLICTING" ]; then
-      echo "  Removing conflicting containers: \$CONFLICTING"
-      \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
-    else
-      echo "  No port conflicts on $APP_PORT"
-    fi
+  if [ "\$HTTP_CODE" != "000" ] && [ "\$HTTP_CODE" != "502" ] && [ "\$HTTP_CODE" != "503" ]; then
+    echo "     ✅ App responded with HTTP \$HTTP_CODE (attempt \$attempt)"
+    HEALTHY=1
+    break
+  fi
 
-    # ────────────────────────────────────────────────────────────────────────
-    # ── R4: ROLLBACK SAVE — tag current :latest as :rollback before touching
-    #        anything. If the new deploy fails we restore from this tag.
-    # ────────────────────────────────────────────────────────────────────────
-    echo ""
-    echo "  ── R4: Saving current image for rollback ───────────────"
-    ROLLBACK_TAG="${IMAGE_NAME}:rollback"
-    ROLLBACK_AVAILABLE=0
-    if \$DCMD image inspect ${IMAGE_NAME}:latest &>/dev/null 2>&1; then
-      if \$DCMD tag ${IMAGE_NAME}:latest \$ROLLBACK_TAG 2>&1; then
-        echo "  ✅ Saved existing image as \$ROLLBACK_TAG"
-        ROLLBACK_AVAILABLE=1
-      else
-        echo "  ⚠️  Could not tag existing image — no rollback available"
-      fi
-    else
-      echo "  No existing image found — this is a fresh deploy, no rollback needed"
-    fi
+  echo "     ⏳ Attempt \$attempt — HTTP \$HTTP_CODE — waiting 3s..."
+  sleep 3
+done
 
-    # ── R5: Load new Docker image ─────────────────────────────────────────────
-    echo ""
-    echo "  ── R5: Loading new Docker image ────────────────────────"
-    if [ ! -f "$TAR_FILE" ]; then
-      echo "  ERROR: $TAR_FILE not found on server"
-      # Rollback if possible
-      if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
-        echo "  Rolling back to previous image..."
-        \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
-        \$DCMD compose up -d
-        echo "  ✅ Rollback complete. Old version restored."
-      fi
-      exit 1
-    fi
-    LOAD_START=\$SECONDS
-    if ! \$DCMD load -i $TAR_FILE 2>&1 | sed 's/^/  /'; then
-      echo "  ERROR: Failed to load Docker image"
-      if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
-        echo "  Rolling back to previous image..."
-        \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
-        \$DCMD compose up -d
-        echo "  ✅ Rollback complete. Old version restored."
-      fi
-      exit 1
-    fi
-    echo "  Load time: \$((SECONDS - LOAD_START))s"
+if [ "\$HEALTHY" -eq 0 ]; then
+  echo "  ⚠️  WARNING: App did not respond on port $APP_PORT after 5 attempts"
+  echo "     The container is running but the app may still be starting"
+  echo "     Check logs with: ./deploy.sh logs"
+  echo "     This is NOT a fatal error — deploy continues"
+fi
+echo ""
 
-    # ── R6: Cleanup — delete tar from server to free disk ────────────────────
-    echo ""
-    echo "  ── R6: Cleaning up tar file from server ────────────────"
-    rm -f $TAR_FILE && echo "  ✅ Tar file deleted (disk freed)" || echo "  ⚠️  Could not delete tar file"
+# ── R10: Container status ─────────────────────────────────────────────────
+echo "  ── R10: Container status ─────────────────────────────────────────"
+\$DCMD compose ps 2>&1 | sed 's/^/     /' || true
+echo ""
 
-    # ── R7: Show available images ─────────────────────────────────────────────
-    echo ""
-    echo "  ── R7: Available images ────────────────────────────────"
-    \$DCMD images | grep -E "REPOSITORY|$IMAGE_NAME" | sed 's/^/  /'
+# ── R11: Last 20 log lines ────────────────────────────────────────────────
+echo "  ── R11: Last 20 log lines ────────────────────────────────────────"
+\$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/     /' || true
+echo ""
 
-    # ── R8: Start new containers ──────────────────────────────────────────────
-    echo ""
-    echo "  ── R8: Starting new containers ─────────────────────────"
-    if ! \$DCMD compose up -d 2>&1 | sed 's/^/  /'; then
-      echo "  ERROR: Failed to start containers"
-      if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
-        echo "  Rolling back to previous image..."
-        \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
-        \$DCMD compose up -d
-        echo "  ✅ Rollback complete. Old version restored."
-      fi
-      exit 1
-    fi
+# ── R12: Prune dangling images (keep :rollback) ───────────────────────────
+echo "  ── R12: Pruning dangling images (keeping :rollback) ─────────────"
+\$DCMD image prune -f 2>&1 | sed 's/^/     /' || true
+echo ""
 
-    # ────────────────────────────────────────────────────────────────────────
-    # ── R9: STARTUP WAIT — give Next.js time to boot (30s)
-    #        then verify the container process is still running.
-    #        No /api/health route required.
-    # ────────────────────────────────────────────────────────────────────────
-    echo ""
-    echo "  ── R9: Waiting 30s for Next.js to boot ─────────────────"
-    for i in 5 10 15 20 25 30; do
-      sleep 5
-      echo "  ⏳ \${i}s elapsed..."
-    done
-    echo "  ✅ Wait complete"
+# ── R13: Final disk usage ─────────────────────────────────────────────────
+echo "  ── R13: Final disk usage ─────────────────────────────────────────"
+df -h $SERVER_PATH | sed 's/^/     /'
+echo ""
+echo "  [REMOTE] ✅ All steps complete"
 
-    # ── R10: Verify container process is still running ────────────────────────
-    echo ""
-    echo "  ── R10: Verifying container is still running ───────────"
-    RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c "Up\|running" || true; })
-    if [ "\$RUNNING" -eq 0 ]; then
-      echo "  ERROR: Container is not running after startup."
-      echo ""
-      echo "  ── Last 50 log lines ───────────────────────────────────"
-      \$DCMD compose logs --tail=50 app 2>&1 | sed 's/^/  /' || true
-
-      # ── ROLLBACK ──────────────────────────────────────────────────────────
-      if [ "\$ROLLBACK_AVAILABLE" -eq 1 ]; then
-        echo ""
-        echo "  ── Rolling back to previous version ────────────────────"
-        \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
-        \$DCMD tag \$ROLLBACK_TAG ${IMAGE_NAME}:latest
-        if \$DCMD compose up -d 2>&1 | sed 's/^/  /'; then
-          echo "  ✅ Rollback complete. Previous version is live again."
-          echo "  ⚠️  Fix the issue in your code then deploy again."
-        else
-          echo "  ❌ Rollback also failed. Manual intervention needed."
-          echo "     SSH in and run: docker compose up -d"
-        fi
-      else
-        echo "  ⚠️  No rollback image available (this was a fresh deploy)."
-        echo "     Fix the issue and deploy again."
-      fi
-      exit 1
-    fi
-    echo "  ✅ Container is running"
-
-    # ── R11: Container status ─────────────────────────────────────────────────
-    echo ""
-    echo "  ── R11: Container status ───────────────────────────────"
-    \$DCMD compose ps 2>&1 | sed 's/^/  /'
-
-    # ── R12: Last 20 log lines ────────────────────────────────────────────────
-    echo ""
-    echo "  ── R12: Last 20 log lines ──────────────────────────────"
-    \$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
-
-    # ── R13: Prune old/unused images ──────────────────────────────────────────
-    # NOTE: we keep the :rollback tag so we can roll back next time
-    echo ""
-    echo "  ── R13: Pruning dangling images (keeping :rollback) ────"
-    \$DCMD image prune -f 2>&1 | sed 's/^/  /'
-
-    # ── R14: Final disk usage ─────────────────────────────────────────────────
-    echo ""
-    echo "  ── R14: Final disk usage ───────────────────────────────"
-    df -h $SERVER_PATH | sed 's/^/  /'
-
-    echo ""
-    echo "  [REMOTE] All steps complete."
 REMOTE
-  REMOTE_EXIT=$?
+
+  local REMOTE_EXIT=$?
 
   if [ $REMOTE_EXIT -ne 0 ]; then
     print_summary
-    step_err "Deployment FAILED (remote exit $REMOTE_EXIT)"
-    printf "  Check the output above for the exact error.\n"
-    printf "  If rollback was available, the old version is live again.\n"
-    printf "  Common causes:\n"
-    printf "   - App crashed on startup — check logs above\n"
-    printf "   - Image name mismatch in docker-compose.yml (expected: %s)\n" "$IMAGE_NAME"
-    printf "   - Missing or wrong environment variables in .env\n"
-    printf "   - Port %s already in use on server\n\n" "$APP_PORT"
+    step_err "DEPLOYMENT FAILED (remote exit $REMOTE_EXIT)"
+    printf "   Check the output above — each step is labelled R1–R13\n"
+    printf "   If rollback was available, old version is live again\n"
+    printf "   Common causes:\n"
+    printf "   - App crashed on startup            → check logs above\n"
+    printf "   - Image name mismatch               → expected: %s\n" "$IMAGE_NAME"
+    printf "   - Missing env vars in .env          → check .env on server\n"
+    printf "   - Port %s already in use           → check: ssh in, netstat -tlnp\n\n" "$APP_PORT"
     exit 1
   fi
 
   print_summary
   printf "  ${GREEN}✅ Deployment complete!${NC}\n"
-  [ -n "$DEPLOY_CLIENT" ] && printf "  ${DIM}   Client : %s${NC}\n" "$DEPLOY_CLIENT"
-  printf "  ${DIM}   Total deploy time : %ss${NC}\n\n" "$((SECONDS - PUSH_TOTAL_START))"
+  [ -n "$DEPLOY_CLIENT" ] && printf "  ${DIM} Client           : %s${NC}\n" "$DEPLOY_CLIENT"
+  printf "  ${DIM} Total deploy time : %ss${NC}\n\n" "$((SECONDS - PUSH_TOTAL_START))"
+  printf "  ${BOLD}App URL :${NC} http://%s:%s\n\n" "$SERVER_IP" "$APP_PORT"
+}
+
+# ── Rollback ──────────────────────────────────────────────────────────────────
+do_rollback() {
+  print_header "Manual Rollback on $SERVER_IP"
+  check_ssh
+
+  step_start "Checking if rollback image exists on server..."
+  local HAS_ROLLBACK
+  HAS_ROLLBACK=$(remote "\
+    if groups | grep -q docker 2>/dev/null; then DCMD=docker; else DCMD=\"sudo docker\"; fi; \
+    \$DCMD image inspect ${IMAGE_NAME}:rollback &>/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
+
+  if [ "$HAS_ROLLBACK" != "yes" ]; then
+    step_err "ROLLBACK FAILED: No :rollback image found on server"
+    printf "   A rollback image is created automatically during each deploy.\n"
+    printf "   You need at least one successful deploy before rollback is available.\n"
+    exit 1
+  fi
+
+  step_ok "Rollback image found"
+
+  printf "  ${YELLOW}⚠️  This will replace the running app with the previous version.${NC}\n"
+  printf "  Continue? (y/N): " >&2
+  local confirm=""
+  read confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    printf "  Aborted.\n\n"; exit 0
+  fi
+
+  printf "\n"
+
+  remote bash << REMOTE
+set -eo pipefail
+
+if groups | grep -q docker 2>/dev/null; then DCMD=docker; else DCMD="sudo docker"; fi
+
+echo "  [ROLLBACK] Starting manual rollback..."
+echo ""
+
+cd $SERVER_PATH || {
+  echo "  ❌ ERROR: Could not cd into $SERVER_PATH"
+  exit 1
+}
+
+echo "  ── Step 1: Stopping current containers ───────────────────────────"
+\$DCMD compose down --remove-orphans 2>&1 | sed 's/^/     /' || true
+echo "  ✅ Stopped"
+echo ""
+
+echo "  ── Step 2: Restoring :rollback as :latest ────────────────────────"
+if ! \$DCMD tag ${IMAGE_NAME}:rollback ${IMAGE_NAME}:latest 2>&1 | sed 's/^/     /'; then
+  echo "  ❌ ERROR: Could not tag rollback image as latest"
+  exit 1
+fi
+echo "  ✅ Restored"
+echo ""
+
+echo "  ── Step 3: Starting restored containers ──────────────────────────"
+if ! \$DCMD compose up -d 2>&1 | sed 's/^/     /'; then
+  echo "  ❌ ERROR: Failed to start rollback containers"
+  exit 1
+fi
+echo "  ✅ Started"
+echo ""
+
+echo "  ── Step 4: Verifying container is running ────────────────────────"
+sleep 4
+RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c "Up\|running" || true; })
+if [ "\$RUNNING" -eq 0 ]; then
+  echo "  ❌ ERROR: Rollback container is not running"
+  \$DCMD compose logs --tail=30 app 2>&1 | sed 's/^/     /' || true
+  exit 1
+fi
+echo "  ✅ Container is running"
+echo ""
+
+echo "  ── Step 5: Container status ──────────────────────────────────────"
+\$DCMD compose ps 2>&1 | sed 's/^/     /' || true
+echo ""
+echo "  [ROLLBACK] ✅ Manual rollback complete"
+
+REMOTE
+
+  local ROLLBACK_EXIT=$?
+  if [ $ROLLBACK_EXIT -ne 0 ]; then
+    step_err "ROLLBACK FAILED (exit $ROLLBACK_EXIT)"
+    printf "   Check the output above for the exact step that failed\n"
+    exit 1
+  fi
+
+  print_summary
+  printf "  ${GREEN}✅ Rollback complete — previous version is live${NC}\n"
   printf "  ${BOLD}App URL :${NC} http://%s:%s\n\n" "$SERVER_IP" "$APP_PORT"
 }
 
@@ -945,69 +1152,73 @@ REMOTE
 do_restart() {
   print_header "Restart on $SERVER_IP"
   check_ssh
+
   step_start "Restarting services..."
   printf "\n"
 
   remote bash << REMOTE
-    set -eo pipefail
+set -eo pipefail
 
-    if groups | grep -q docker 2>/dev/null; then
-      DCMD="docker"
-    else
-      DCMD="sudo docker"
-    fi
-    echo "  [REMOTE] Docker command: \$DCMD"
+if groups | grep -q docker 2>/dev/null; then DCMD=docker; else DCMD="sudo docker"; fi
 
-    cd $SERVER_PATH
+echo "  [REMOTE] Docker command: \$DCMD"
 
-    echo "  ── Stopping containers ─────────────────────────────────"
-    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /' || true
+cd $SERVER_PATH || {
+  echo "  ❌ ERROR: Could not cd into $SERVER_PATH"
+  exit 1
+}
 
-    echo ""
-    echo "  ── Removing known containers ───────────────────────────"
-    \$DCMD rm -f ${APP_NAME}_app redis_container 2>&1 | sed 's/^/  /' || true
+echo "  ── Stopping containers ───────────────────────────────────────────"
+\$DCMD compose down --remove-orphans 2>&1 | sed 's/^/     /' || true
+echo ""
 
-    echo ""
-    echo "  ── Checking port $APP_PORT ──────────────────────────────"
-    CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT")
-    if [ -n "\$CONFLICTING" ]; then
-      \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/  /'
-    else
-      echo "  No port conflicts"
-    fi
+echo "  ── Checking port $APP_PORT ───────────────────────────────────────"
+CONFLICTING=\$(\$DCMD ps -q --filter "publish=$APP_PORT" 2>/dev/null || echo "")
+if [ -n "\$CONFLICTING" ]; then
+  echo "     Removing conflicting containers..."
+  \$DCMD rm -f \$CONFLICTING 2>&1 | sed 's/^/     /' || true
+else
+  echo "     No port conflicts"
+fi
+echo ""
 
-    echo ""
-    echo "  ── Starting services ───────────────────────────────────"
-    \$DCMD compose up -d
+echo "  ── Starting services ─────────────────────────────────────────────"
+if ! \$DCMD compose up -d 2>&1 | sed 's/^/     /'; then
+  echo "  ❌ ERROR: docker compose up failed"
+  echo "     Check your docker-compose.yml and .env on the server"
+  exit 1
+fi
+echo ""
 
-    # ── Simple startup wait — no /api/health needed ──────────────────────────
-    echo ""
-    echo "  ── Waiting 30s for Next.js to boot ─────────────────────"
-    for i in 5 10 15 20 25 30; do
-      sleep 5
-      echo "  ⏳ \${i}s elapsed..."
-    done
+echo "  ── Polling for startup (max 60s) ─────────────────────────────────"
+BOOT_START=\$SECONDS
+BOOTED=0
+while [ \$((SECONDS - BOOT_START)) -lt 60 ]; do
+  RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c "Up\|running" || true; })
+  if [ "\$RUNNING" -gt 0 ]; then BOOTED=1; break; fi
+  echo "     ⏳ \$((SECONDS - BOOT_START))s — waiting..."
+  sleep 2
+done
 
-    RUNNING=\$(\$DCMD compose ps 2>/dev/null | { grep -c "Up\|running" || true; })
-    if [ "\$RUNNING" -eq 0 ]; then
-      echo "  ERROR: Container is not running after restart"
-      \$DCMD compose logs --tail=50 2>&1 | sed 's/^/  /' || true
-      exit 1
-    fi
-    echo "  ✅ Container is running"
+if [ "\$BOOTED" -eq 0 ]; then
+  echo "  ❌ ERROR: Container did not start within 60 seconds after restart"
+  \$DCMD compose logs --tail=50 2>&1 | sed 's/^/     /' || true
+  exit 1
+fi
 
-    echo ""
-    echo "  ── Container status ────────────────────────────────────"
-    \$DCMD compose ps 2>&1 | sed 's/^/  /'
+echo "     ✅ Container started in \$((SECONDS - BOOT_START))s"
+echo ""
+echo "  ── Container status ──────────────────────────────────────────────"
+\$DCMD compose ps 2>&1 | sed 's/^/     /' || true
+echo ""
+echo "  ── Last 20 log lines ─────────────────────────────────────────────"
+\$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/     /' || true
 
-    echo ""
-    echo "  ── Last 20 log lines ───────────────────────────────────"
-    \$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/  /' || true
 REMOTE
-  REMOTE_EXIT=$?
 
+  local REMOTE_EXIT=$?
   if [ $REMOTE_EXIT -ne 0 ]; then
-    step_err "Restart FAILED — check logs above"
+    step_err "RESTART FAILED — check logs above for which step failed"
     exit 1
   fi
 
@@ -1019,20 +1230,24 @@ REMOTE
 do_stop() {
   print_header "Stop on $SERVER_IP"
   check_ssh
-  step_start "Stopping all containers..."
-  remote bash << REMOTE
-    if groups | grep -q docker 2>/dev/null; then
-      DCMD="docker"
-    else
-      DCMD="sudo docker"
-    fi
 
-    cd $SERVER_PATH
-    \$DCMD compose down --remove-orphans 2>&1 | sed 's/^/  /'
-    echo ""
-    echo "  ── Remaining containers ────────────────────────────────"
-    \$DCMD ps 2>&1 | sed 's/^/  /'
+  step_start "Stopping all containers..."
+
+  remote bash << REMOTE
+if groups | grep -q docker 2>/dev/null; then DCMD=docker; else DCMD="sudo docker"; fi
+
+cd $SERVER_PATH || {
+  echo "  ❌ ERROR: Could not cd into $SERVER_PATH"
+  exit 1
+}
+
+\$DCMD compose down --remove-orphans 2>&1 | sed 's/^/     /'
+echo ""
+echo "  ── Remaining containers on server ────────────────────────────────"
+\$DCMD ps 2>&1 | sed 's/^/     /'
+
 REMOTE
+
   step_ok "All containers stopped"
 }
 
@@ -1040,35 +1255,49 @@ REMOTE
 do_logs() {
   print_header "Logs from $SERVER_IP"
   check_ssh
+
   printf "${DIM}  Tailing logs... Ctrl+C to exit${NC}\n\n"
+
   remote bash << REMOTE
-    if groups | grep -q docker 2>/dev/null; then
-      DCMD="docker"
-    else
-      DCMD="sudo docker"
-    fi
-    cd $SERVER_PATH && \$DCMD compose logs -f app
+if groups | grep -q docker 2>/dev/null; then DCMD=docker; else DCMD="sudo docker"; fi
+
+cd $SERVER_PATH || {
+  echo "  ❌ ERROR: Could not cd into $SERVER_PATH"
+  exit 1
+}
+
+\$DCMD compose logs -f app
+
 REMOTE
 }
 
 # ── Local ─────────────────────────────────────────────────────────────────────
 do_local() {
   print_header "Local Test"
+
   step_start "Building image locally..."
-  docker build -t "$IMAGE_NAME:latest" .
+  docker build -t "$IMAGE_NAME:latest" . || {
+    step_err "LOCAL BUILD FAILED: docker build exited with an error"
+    exit 1
+  }
   step_ok "Local image built"
+
   step_start "Starting local compose..."
-  docker compose -f docker-compose.local.yml up
+  docker compose -f docker-compose.local.yml up || {
+    step_err "LOCAL START FAILED: docker compose up exited with an error"
+    exit 1
+  }
 }
 
 # ── Router ────────────────────────────────────────────────────────────────────
 case "$CMD" in
-  build)   do_build   ;;
-  push)    do_push    ;;
-  restart) do_restart ;;
-  stop)    do_stop    ;;
-  logs)    do_logs    ;;
-  local)   do_local   ;;
+  build)    do_build ;;
+  push)     do_push ;;
+  rollback) do_rollback ;;
+  restart)  do_restart ;;
+  stop)     do_stop ;;
+  logs)     do_logs ;;
+  local)    do_local ;;
   client)
     case "$2" in
       --list)   do_client_list ;;
@@ -1081,11 +1310,18 @@ case "$CMD" in
     esac
     ;;
   *)
-    printf "Usage: ./deploy.sh [build|push|restart|stop|logs|local|client]\n"
-    printf "       ./deploy.sh push --client GCKC\n"
-    printf "       ./deploy.sh client --list\n"
-    printf "       ./deploy.sh client --add\n"
-    printf "       ./deploy.sh client --remove NAME\n"
+    printf "\nUsage: ./deploy.sh [COMMAND]\n\n"
+    printf "  build              Build image + export tar locally\n"
+    printf "  push               Build + upload + deploy to server\n"
+    printf "  push --client NAME Deploy for a specific client\n"
+    printf "  rollback           Restore previous :rollback image on server\n"
+    printf "  restart            Restart containers on server\n"
+    printf "  stop               Stop containers on server\n"
+    printf "  logs               Tail live server logs\n"
+    printf "  local              Run locally for testing\n"
+    printf "  client --list      List all clients in deploy.config.sh\n"
+    printf "  client --add       Add a new client\n"
+    printf "  client --remove N  Remove a client\n\n"
     exit 1
     ;;
 esac
