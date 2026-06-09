@@ -357,7 +357,7 @@ do_setup() {
     # ── Step 6: Server Path ───────────────────────────────────────────────────
     section "Step 6 of 7 — Server Folder Path"
     info "Folder on the server where app files will be uploaded"
-    SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
+    SERVER_PATH=$(ask "Server folder path" "/home/$SERVER_USER/$APP_NAME_LOWER")
     printf "\n"
 
     # ── Step 7: Clients ───────────────────────────────────────────────────────
