@@ -433,29 +433,47 @@ do_build() {
     done
   set +o pipefail
 
-  if [ $BUILD_EXIT -ne 0 ]; then
+  if [ "${BUILD_EXIT:-0}" -ne 0 ]; then
     step_err "Docker build FAILED (exit $BUILD_EXIT)"
     printf "   Fix the build error above, then run: ./deploy.sh push\n"
     exit 1
   fi
   step_ok "Docker image built successfully"
 
-  step_start "Checking image details..."
+  # Show image size quickly without hanging
+  IMG_SIZE=$(docker images "$IMAGE_NAME:latest" --format "{{.Size}}" 2>/dev/null || echo "unknown")
+  IMG_ID=$(docker images "$IMAGE_NAME:latest" --format "{{.ID}}" 2>/dev/null || echo "unknown")
+  info "  Image ID   : $IMG_ID"
+  info "  Image size : $IMG_SIZE"
   printf "\n"
-  docker images "$IMAGE_NAME:latest" --format "  ID:      {{.ID}}\n  Size:    {{.Size}}\n  Created: {{.CreatedAt}}"
-  printf "\n"
-  step_ok "Image info retrieved"
 
   step_start "Exporting image to $TAR_FILE..."
-  info "  This may take 1-3 minutes..."
+  info "  This may take 2-4 minutes (compressing image)..."
+  info "  You will see the file size grow below..."
   printf "\n"
 
   EXPORT_START=$SECONDS
-  docker save "$IMAGE_NAME:latest" | gzip > "$TAR_FILE" || {
+  # Run export in background and show live file size progress
+  docker save "$IMAGE_NAME:latest" | gzip > "$TAR_FILE" &
+  EXPORT_PID=$!
+  while kill -0 $EXPORT_PID 2>/dev/null; do
+    if [ -f "$TAR_FILE" ]; then
+      CURRENT_SIZE=$(du -sh "$TAR_FILE" 2>/dev/null | cut -f1)
+      printf "\r  ${DIM}  Saving... %s${NC}    " "$CURRENT_SIZE"
+    else
+      printf "\r  ${DIM}  Starting export...${NC}    "
+    fi
+    sleep 2
+  done
+  wait $EXPORT_PID
+  EXPORT_STATUS=$?
+  printf "\n"
+
+  if [ $EXPORT_STATUS -ne 0 ]; then
     step_err "Failed to export Docker image to $TAR_FILE"
     printf "   Check disk space: df -h .\n"
     exit 1
-  }
+  fi
   EXPORT_TIME=$((SECONDS - EXPORT_START))
   SIZE=$(du -sh "$TAR_FILE" | cut -f1)
 
