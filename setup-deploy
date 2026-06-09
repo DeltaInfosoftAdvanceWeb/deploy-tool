@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ── setup-deploy ──────────────────────────────────────────────────────────────
-# Version: 2.4.0
+# Version: 2.5.0
 # Usage:
 #   setup-deploy               → setup new project
 #   setup-deploy --install     → first time install on this Mac
@@ -20,7 +20,7 @@
 
 main() {
 
-DEPLOY_VERSION="2.4.0"
+DEPLOY_VERSION="2.5.0"
 GITHUB_RAW="https://raw.githubusercontent.com/DeltaInfosoftAdvanceWeb/deploy-tool/main"
 DEPLOY_DIR="$HOME/.deploy"
 
@@ -75,6 +75,13 @@ ask() {
       err "This field cannot be empty. Please enter a value." >&2
     fi
   done
+  echo "$value"
+}
+
+ask_optional() {
+  local prompt="$1"
+  printf " ? %s (optional, press Enter to skip): " "$prompt" >&2
+  read value
   echo "$value"
 }
 
@@ -266,7 +273,7 @@ do_setup() {
   fi
 
   printf " ${DIM}Answer each question. Press Enter to use [default] value.${NC}\n"
-  printf " ${DIM}Server password stored in macOS Keychain. Env vars saved in deploy.config.sh.${NC}\n\n"
+  printf " ${DIM}Server password stored in macOS Keychain. Client configs saved in deploy.config.sh.${NC}\n\n"
 
   while true; do
 
@@ -338,24 +345,100 @@ do_setup() {
     SERVER_PATH=$(ask "Server folder path" "~/$APP_NAME_LOWER")
     printf "\n"
 
-    # ── Step 7: Environment Variables ────────────────────────────────────────
-    section "Step 7 of 7 — Environment Variables"
-    printf " ${DIM} Paste your .env lines below (NEXT_PUBLIC_ vars, API URLs, etc).${NC}\n"
-    printf " ${DIM} Paste all lines, then press Enter on a blank line to finish.${NC}\n\n"
+    # ── Step 7: Clients ───────────────────────────────────────────────────────
+    section "Step 7 of 7 — Clients"
+    info "How many clients will this app deploy to? Enter 0 for single deployment."
+    printf "\n"
 
-    ENV_PASTE_LINES=""
-    while IFS= read -r line; do
-      [ -z "$line" ] && break
-      ENV_PASTE_LINES="${ENV_PASTE_LINES}${line}"$'\n'
-    done
+    CLIENT_COUNT=$(ask_number "Number of clients" "0" "0" "20")
+    printf "\n"
 
-    if [ -z "$ENV_PASTE_LINES" ]; then
-      warn "No env vars entered — .env will be empty on server."
+    # Arrays to hold all client data
+    CLIENT_NAMES=()
+    CLIENT_IDS=()
+    CLIENT_ENVS=()
+
+    if [ "$CLIENT_COUNT" -gt 0 ]; then
+      local i=1
+      while [ "$i" -le "$CLIENT_COUNT" ]; do
+
+        printf "  ${BOLD}${CYAN}── Client $i of $CLIENT_COUNT ────────────────────────${NC}\n\n"
+
+        # Client name
+        local cname=""
+        while true; do
+          cname=$(ask "  Client name (e.g. GCKC, DARA, Samarth)")
+          if echo "$cname" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+            # Check duplicate
+            local dup=0
+            for existing in "${CLIENT_NAMES[@]}"; do
+              [ "$existing" = "$cname" ] && dup=1 && break
+            done
+            if [ "$dup" -eq 1 ]; then
+              err "Client name '$cname' already used. Use a unique name." >&2
+            else
+              break
+            fi
+          else
+            err "Only letters, numbers, hyphens, underscores. No spaces." >&2
+          fi
+        done
+
+        # Client ID (optional)
+        local cid=""
+        cid=$(ask_optional "  Client ID for $cname")
+
+        # Paste env vars for this client
+        printf "\n"
+        printf "  ${DIM}Paste all .env lines for ${BOLD}${cname}${NC}${DIM} below.${NC}\n"
+        printf "  ${DIM}Press Enter on a blank line when done.${NC}\n\n"
+
+        local cenv=""
+        while IFS= read -r line; do
+          [ -z "$line" ] && break
+          cenv="${cenv}${line}"$'\n'
+        done
+
+        if [ -z "$cenv" ]; then
+          warn "No env vars entered for $cname — .env will be empty for this client."
+        else
+          local lc
+          lc=$(printf "%s" "$cenv" | grep -c '.' || true)
+          success "$lc env var(s) captured for $cname"
+        fi
+
+        CLIENT_NAMES+=("$cname")
+        CLIENT_IDS+=("$cid")
+        CLIENT_ENVS+=("$cenv")
+
+        printf "\n"
+        i=$((i + 1))
+      done
+
     else
-      local line_count
-      line_count=$(printf "%s" "$ENV_PASTE_LINES" | grep -c '.' || true)
-      success "$line_count env var(s) captured"
+      # Single deployment — paste one env block
+      printf "\n"
+      printf "  ${DIM}Paste your .env lines below. Press Enter on a blank line when done.${NC}\n\n"
+
+      local single_env=""
+      while IFS= read -r line; do
+        [ -z "$line" ] && break
+        single_env="${single_env}${line}"$'\n'
+      done
+
+      if [ -z "$single_env" ]; then
+        warn "No env vars entered — .env will be empty on server."
+      else
+        local lc
+        lc=$(printf "%s" "$single_env" | grep -c '.' || true)
+        success "$lc env var(s) captured"
+      fi
+
+      CLIENT_NAMES=("__single__")
+      CLIENT_IDS=("")
+      CLIENT_ENVS=("$single_env")
     fi
+
     printf "\n"
 
     # ── Server password ───────────────────────────────────────────────────────
@@ -394,13 +477,32 @@ do_setup() {
     printf "  ${BOLD}Server path :${NC} %s\n" "$SERVER_PATH"
     printf "  ${BOLD}SSH password:${NC} ${DIM}(stored in Keychain)${NC}\n"
 
-    if [ -n "$ENV_PASTE_LINES" ]; then
-      printf "  ${BOLD}Env vars    :${NC}\n"
-      printf "%s" "$ENV_PASTE_LINES" | while IFS= read -r l; do
-        [ -n "$l" ] && printf "    ${DIM}%s${NC}\n" "$l"
+    if [ "$CLIENT_COUNT" -gt 0 ]; then
+      printf "  ${BOLD}Clients     :${NC}\n"
+      local j=0
+      while [ "$j" -lt "${#CLIENT_NAMES[@]}" ]; do
+        local cname="${CLIENT_NAMES[$j]}"
+        local cid="${CLIENT_IDS[$j]}"
+        local cenv="${CLIENT_ENVS[$j]}"
+        local lc
+        lc=$(printf "%s" "$cenv" | grep -c '.' 2>/dev/null || echo 0)
+        if [ -n "$cid" ]; then
+          printf "\n    ${BOLD}%s${NC} ${DIM}(ID: %s)${NC} — %s env var(s)\n" "$cname" "$cid" "$lc"
+        else
+          printf "\n    ${BOLD}%s${NC} — %s env var(s)\n" "$cname" "$lc"
+        fi
+        printf "%s" "$cenv" | while IFS= read -r l; do
+          [ -n "$l" ] && printf "      ${DIM}%s${NC}\n" "$l"
+        done
+        j=$((j + 1))
       done
     else
-      printf "  ${BOLD}Env vars    :${NC} ${DIM}(none)${NC}\n"
+      local lc
+      lc=$(printf "%s" "${CLIENT_ENVS[0]}" | grep -c '.' 2>/dev/null || echo 0)
+      printf "  ${BOLD}Env vars    :${NC} %s var(s)\n" "$lc"
+      printf "%s" "${CLIENT_ENVS[0]}" | while IFS= read -r l; do
+        [ -n "$l" ] && printf "    ${DIM}%s${NC}\n" "$l"
+      done
     fi
 
     printf "\n"
@@ -416,15 +518,15 @@ do_setup() {
     else
       warn "Starting over..."
       printf "\n"
+      CLIENT_NAMES=()
+      CLIENT_IDS=()
+      CLIENT_ENVS=()
     fi
 
   done
 
   # ── Write deploy.config.sh ────────────────────────────────────────────────
   info "Writing deploy.config.sh ..."
-
-  # Escape single quotes in ENV_PASTE_LINES for safe storage
-  ESCAPED_ENV=$(printf "%s" "$ENV_PASTE_LINES" | sed "s/'/'\\\\''/g")
 
   {
     printf "# ── Deploy Configuration ────────────────────────────────────────────────────\n"
@@ -436,17 +538,63 @@ do_setup() {
     printf "SERVER_IP=\"%s\"\n" "$SERVER_IP"
     printf "SERVER_USER=\"%s\"\n" "$SERVER_USER"
     printf "SERVER_PATH=\"%s\"\n" "$SERVER_PATH"
-    printf "APP_PORT=\"%s\"\n" "$APP_PORT"
-    printf "\n# Pasted environment variables (written to .env on server at deploy time)\n"
-    printf "PASTED_ENV_VARS='%s'\n" "$ESCAPED_ENV"
+    printf "APP_PORT=\"%s\"\n\n" "$APP_PORT"
+
+    if [ "$CLIENT_COUNT" -gt 0 ]; then
+      # Build space-separated client name list
+      local names_list=""
+      local j=0
+      while [ "$j" -lt "${#CLIENT_NAMES[@]}" ]; do
+        names_list="$names_list ${CLIENT_NAMES[$j]}"
+        j=$((j + 1))
+      done
+      names_list="${names_list# }"   # trim leading space
+
+      printf "# Clients (space-separated)\n"
+      printf "DEPLOY_CLIENTS=\"%s\"\n\n" "$names_list"
+
+      # Write each client block
+      local j=0
+      while [ "$j" -lt "${#CLIENT_NAMES[@]}" ]; do
+        local cname="${CLIENT_NAMES[$j]}"
+        local cid="${CLIENT_IDS[$j]}"
+        local cenv="${CLIENT_ENVS[$j]}"
+        local escaped_env
+        escaped_env=$(printf "%s" "$cenv" | sed "s/'/'\\\\''/g")
+
+        printf "# ── Client: %s ──\n" "$cname"
+        printf "CLIENT_%s_NAME=\"%s\"\n" "$cname" "$cname"
+        if [ -n "$cid" ]; then
+          printf "CLIENT_%s_ID=\"%s\"\n" "$cname" "$cid"
+        else
+          printf "CLIENT_%s_ID=\"\"\n" "$cname"
+        fi
+        printf "CLIENT_%s_ENV='%s'\n\n" "$cname" "$escaped_env"
+
+        j=$((j + 1))
+      done
+
+    else
+      # Single deployment
+      printf "# Single deployment (no clients)\n"
+      printf "DEPLOY_CLIENTS=\"\"\n\n"
+      local escaped_env
+      escaped_env=$(printf "%s" "${CLIENT_ENVS[0]}" | sed "s/'/'\\\\''/g")
+      printf "# Environment variables\n"
+      printf "PASTED_ENV_VARS='%s'\n" "$escaped_env"
+    fi
+
   } > deploy.config.sh
 
   success "deploy.config.sh created"
 
-  # ── Write .env locally from pasted vars ──────────────────────────────────
-  if [ -n "$ENV_PASTE_LINES" ]; then
-    printf "%s" "$ENV_PASTE_LINES" > .env
-    success ".env written locally from pasted vars"
+  # ── Write .env locally (first client or single) ───────────────────────────
+  if [ "$CLIENT_COUNT" -gt 0 ]; then
+    printf "%s" "${CLIENT_ENVS[0]}" > .env
+    success ".env written locally for first client (${CLIENT_NAMES[0]})"
+  else
+    printf "%s" "${CLIENT_ENVS[0]}" > .env
+    success ".env written locally"
   fi
 
   # ── Write deploy.sh wrapper ───────────────────────────────────────────────
@@ -477,9 +625,14 @@ EOF
   printf " ${BOLD}Files created:${NC}\n"
   printf "  ${DIM}deploy.sh        — safe to commit${NC}\n"
   printf "  ${DIM}deploy.config.sh — gitignored, no secrets${NC}\n"
-  printf "  ${DIM}.env             — written from your pasted vars${NC}\n\n"
+  printf "  ${DIM}.env             — written from first client / single env${NC}\n\n"
   printf " ${BOLD}Deploy commands:${NC}\n"
-  printf "  ${CYAN}./deploy.sh push     ${DIM}# build + upload + restart${NC}\n"
+  if [ "$CLIENT_COUNT" -gt 0 ]; then
+    printf "  ${CYAN}./deploy.sh push --client CLIENTNAME  ${DIM}# deploy specific client${NC}\n"
+    printf "  ${CYAN}./deploy.sh push                      ${DIM}# shows client list to pick${NC}\n"
+  else
+    printf "  ${CYAN}./deploy.sh push     ${DIM}# build + upload + restart${NC}\n"
+  fi
   printf "  ${CYAN}./deploy.sh restart  ${DIM}# just restart server${NC}\n"
   printf "  ${CYAN}./deploy.sh logs     ${DIM}# tail live logs${NC}\n"
   printf "  ${CYAN}./deploy.sh stop     ${DIM}# stop server${NC}\n\n"
