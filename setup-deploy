@@ -303,6 +303,21 @@ do_setup() {
       fi
     done
     printf "\n"
+    
+    # ── Step 2b: Docker Image Name ────────────────────────────────────────────
+    section "Step 2b — Docker Image Name"
+    info "This is the image: value in your docker-compose.yml"
+    info "Use lowercase letters, numbers, hyphens only (e.g. proniq, delta-auth)"
+    while true; do
+      IMAGE_NAME=$(ask "Docker image name" "${APP_NAME_LOWER}")
+      if echo "$IMAGE_NAME" | grep -qE '^[a-z0-9_-]+$'; then break
+      else
+        err "Must be lowercase letters, numbers, hyphens, underscores only." >&2
+        hint "Example: proniq, myapp, delta-auth" >&2
+      fi
+    done
+    printf "\n"
+
 
     # ── Step 3: Server IP ─────────────────────────────────────────────────────
     section "Step 3 of 7 — Server IP Address"
@@ -535,6 +550,7 @@ do_setup() {
     printf "# IMAGE_NAME is read from docker-compose.yml at deploy time — not stored here\n\n"
     printf "APP_NAME=\"%s\"\n" "$APP_NAME"
     printf "TAR_FILE=\"%s\"\n" "$TAR_FILE"
+    printf "IMAGE_NAME=\"%s\"\n" "$IMAGE_NAME"
     printf "SERVER_IP=\"%s\"\n" "$SERVER_IP"
     printf "SERVER_USER=\"%s\"\n" "$SERVER_USER"
     printf "SERVER_PATH=\"%s\"\n" "$SERVER_PATH"
@@ -614,14 +630,7 @@ do_setup() {
 
   success "deploy.config.sh created"
 
-  # ── Write .env locally (first client or single) ───────────────────────────
-  if [ "$CLIENT_COUNT" -gt 0 ]; then
-    printf "%s" "${CLIENT_ENVS[0]}" > .env
-    success ".env written locally for first client (${CLIENT_NAMES[0]})"
-  else
-    printf "%s" "${CLIENT_ENVS[0]}" > .env
-    success ".env written locally"
-  fi
+
 
   # ── Write deploy.sh wrapper ───────────────────────────────────────────────
   info "Writing deploy.sh ..."
@@ -651,7 +660,7 @@ EOF
   printf " ${BOLD}Files created:${NC}\n"
   printf "  ${DIM}deploy.sh        — safe to commit${NC}\n"
   printf "  ${DIM}deploy.config.sh — gitignored, no secrets${NC}\n"
-  printf "  ${DIM}.env             — written from first client / single env${NC}\n\n"
+  printf " ${BOLD}Note:${NC} Your .env file was NOT touched. Manage it yourself.\n\n"
   printf " ${BOLD}Deploy commands:${NC}\n"
   if [ "$CLIENT_COUNT" -gt 0 ]; then
     printf "  ${CYAN}./deploy.sh push --client CLIENTNAME  ${DIM}# deploy specific client${NC}\n"
