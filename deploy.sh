@@ -409,24 +409,28 @@ do_build() {
     BUILD_DB_URL=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-dburl" -w 2>/dev/null || echo "")
   fi
 
-  set -o pipefail
-  docker build --platform linux/amd64 -t "$IMAGE_NAME:latest" \
+  docker build --platform linux/amd64 --progress=plain \
+    -t "$IMAGE_NAME:latest" \
     ${BUILD_DB_URL:+--build-arg DATABASE_URL="$BUILD_DB_URL"} \
     . 2>&1 | \
     while IFS= read -r line; do
-      if echo "$line" | grep -qiE "^(#[0-9]|Step [0-9])"; then
-        printf "  ${CYAN}%s${NC}\n" "$line"
+      TS="$(date '+%H:%M:%S')"
+      if echo "$line" | grep -qiE "CACHED"; then
+        printf "${GREEN}[${TS}] ⚡ CACHED  %s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "^#[0-9]"; then
+        printf "${CYAN}[${TS}] 🔨 %s${NC}\n" "$line"
       elif echo "$line" | grep -qiE "error|failed|cannot|denied"; then
-        printf "  ${RED}%s${NC}\n" "$line"
+        printf "${RED}[${TS}] ❌ %s${NC}\n" "$line"
       elif echo "$line" | grep -qiE "warn|warning"; then
-        printf "  ${YELLOW}%s${NC}\n" "$line"
-      elif echo "$line" | grep -qiE "successfully|complete|done|cached"; then
-        printf "  ${GREEN}%s${NC}\n" "$line"
+        printf "${YELLOW}[${TS}] ⚠️  %s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "done|complete|finished|exported"; then
+        printf "${GREEN}[${TS}] ✅ %s${NC}\n" "$line"
+      elif echo "$line" | grep -qiE "npm|apk|added|packages|fetch|installing"; then
+        printf "${DIM}[${TS}] 📦 %s${NC}\n" "$line"
       else
-        printf "  ${DIM}%s${NC}\n" "$line"
+        printf "${DIM}[${TS}]    %s${NC}\n" "$line"
       fi
     done
-  local BUILD_EXIT=$?
   set +o pipefail
 
   if [ $BUILD_EXIT -ne 0 ]; then
