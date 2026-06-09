@@ -385,9 +385,144 @@ do_client_remove() {
   printf "${GREEN}  ✅ Client '%s' removed from .env${NC}\n\n" "$client"
 }
 
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+# Runs before every build/push — catches all common issues upfront
+# so deploy never silently hangs
+do_preflight() {
+  printf "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
+  printf "${BOLD}${CYAN}  Pre-flight Checks${NC}\n"
+  printf "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n\n"
+
+  local PASS=0
+  local FAIL=0
+
+  check_pass() { printf "  ${GREEN}✅ %s${NC}\n" "$1"; PASS=$((PASS+1)); }
+  check_fail() { printf "  ${RED}❌ %s${NC}\n" "$1"; printf "     ${DIM}→ %s${NC}\n" "$2"; FAIL=$((FAIL+1)); }
+  check_warn() { printf "  ${YELLOW}⚠️  %s${NC}\n" "$1"; printf "     ${DIM}→ %s${NC}\n" "$2"; }
+
+  # ── 1. Docker Desktop running? ───────────────────────────────────────────
+  printf "  ${DIM}Checking Docker...${NC}\n"
+  if docker info > /dev/null 2>&1; then
+    DOCKER_VER=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
+    check_pass "Docker is running (v$DOCKER_VER)"
+  else
+    check_fail "Docker is NOT running or socket is disconnected"       "Fix: Open Docker Desktop app and wait 30 seconds, then retry"
+    printf "\n  ${RED}Cannot continue without Docker. Exiting.${NC}\n\n"
+    exit 1
+  fi
+
+  # ── 2. Docker buildx available? ──────────────────────────────────────────
+  if docker buildx version > /dev/null 2>&1; then
+    check_pass "Docker buildx available (cross-platform builds supported)"
+  else
+    check_fail "Docker buildx not found"       "Fix: Update Docker Desktop to latest version"
+    exit 1
+  fi
+
+  # ── 3. Dockerfile exists? ────────────────────────────────────────────────
+  if [ -f "Dockerfile" ]; then
+    check_pass "Dockerfile found"
+  else
+    check_fail "Dockerfile not found in current directory"       "Fix: Make sure you are in your project root folder: $(pwd)"
+    exit 1
+  fi
+
+  # ── 4. docker-compose.yml exists? ───────────────────────────────────────
+  if [ -f "docker-compose.yml" ]; then
+    check_pass "docker-compose.yml found"
+  else
+    check_fail "docker-compose.yml not found"       "Fix: Add a docker-compose.yml to your project root"
+    exit 1
+  fi
+
+  # ── 5. Image name in docker-compose.yml? ────────────────────────────────
+  COMPOSE_IMG=$(grep -E "^\s*image\s*:" docker-compose.yml | head -1 | sed "s/.*image\s*:\s*//" | sed "s/:.*//" | tr -d " \"'")
+  if [ -n "$COMPOSE_IMG" ]; then
+    check_pass "Image name found in docker-compose.yml: $COMPOSE_IMG"
+  else
+    check_fail "No 'image:' line in docker-compose.yml"       "Fix: Run: setup-deploy --fix"
+    exit 1
+  fi
+
+  # ── 6. .env file exists? ────────────────────────────────────────────────
+  if [ -f ".env" ]; then
+    check_pass ".env file found"
+  else
+    check_fail ".env file not found"       "Fix: Create a .env file with your environment variables"
+    exit 1
+  fi
+
+  # ── 7. deploy.config.sh exists? ─────────────────────────────────────────
+  CONFIG_FILE="$(dirname "$0")/deploy.config.sh"
+  if [ -f "$CONFIG_FILE" ]; then
+    check_pass "deploy.config.sh found"
+  else
+    check_fail "deploy.config.sh not found"       "Fix: Run: setup-deploy"
+    exit 1
+  fi
+
+  # ── 8. Server password in Keychain? ─────────────────────────────────────
+  _PASS=$(security find-generic-password -a "$SERVER_USER" -s "deploy-${APP_NAME}-server" -w 2>/dev/null || echo "")
+  if [ -n "$_PASS" ]; then
+    check_pass "Server password found in Keychain"
+  else
+    check_fail "Server password not found in Keychain"       "Fix: Run: setup-deploy --update-secrets"
+    exit 1
+  fi
+
+  # ── 9. Server reachable (ping)? ─────────────────────────────────────────
+  printf "  ${DIM}Checking server reachability...${NC}\n"
+  if ping -c 1 -W 3 "$SERVER_IP" > /dev/null 2>&1; then
+    check_pass "Server $SERVER_IP is reachable"
+  else
+    check_fail "Cannot reach server $SERVER_IP"       "Fix: Check VPN is connected, or server IP is correct ($SERVER_IP)"
+    printf "\n  ${RED}Server unreachable. Is your VPN connected?${NC}\n\n"
+    exit 1
+  fi
+
+  # ── 10. SSH connection works? ────────────────────────────────────────────
+  printf "  ${DIM}Testing SSH connection...${NC}\n"
+  SSH_RESULT=$(sshpass -p "$_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10     "$SERVER_USER@$SERVER_IP" "echo OK" 2>&1)
+  if [ "$SSH_RESULT" = "OK" ]; then
+    check_pass "SSH connection to $SERVER_USER@$SERVER_IP successful"
+  else
+    check_fail "SSH connection failed to $SERVER_USER@$SERVER_IP"       "Fix: Check username/password with: setup-deploy --update-secrets"
+    printf "     ${DIM}Error: %s${NC}\n" "$SSH_RESULT"
+    exit 1
+  fi
+
+  # ── 11. Disk space on Mac (for tar export)? ─────────────────────────────
+  MAC_FREE_GB=$(df -g . 2>/dev/null | awk "NR==2{print \$4}")
+  if [ -n "$MAC_FREE_GB" ] && [ "$MAC_FREE_GB" -ge 2 ] 2>/dev/null; then
+    check_pass "Mac disk space OK (${MAC_FREE_GB}GB free)"
+  else
+    check_warn "Low disk space on Mac (${MAC_FREE_GB}GB free)"       "Need at least 2GB free for tar export"
+  fi
+
+  # ── 12. Disk space on server? ───────────────────────────────────────────
+  SERVER_FREE=$(sshpass -p "$_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10     "$SERVER_USER@$SERVER_IP" "df -m / | awk \"NR==2{print \$4}\"" 2>/dev/null || echo 0)
+  if [ "$SERVER_FREE" -ge 2048 ] 2>/dev/null; then
+    SERVER_FREE_GB=$(( SERVER_FREE / 1024 ))
+    check_pass "Server disk space OK (${SERVER_FREE_GB}GB free)"
+  else
+    check_warn "Low disk space on server (${SERVER_FREE}MB free)"       "Run on server: sudo docker system prune -af"
+  fi
+
+  # ── Summary ──────────────────────────────────────────────────────────────
+  printf "\n${DIM}  ──────────────────────────────────────────${NC}\n"
+  if [ "$FAIL" -eq 0 ]; then
+    printf "  ${GREEN}${BOLD}All checks passed! Starting deploy...${NC}\n\n"
+  else
+    printf "  ${RED}${BOLD}%d check(s) failed. Fix the issues above and retry.${NC}\n\n" "$FAIL"
+    exit 1
+  fi
+}
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 do_build() {
   local BUILD_TOTAL_START=$SECONDS
+  do_preflight
   print_header "Build"
 
   if [ ! -f "Dockerfile" ]; then
