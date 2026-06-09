@@ -84,16 +84,20 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 source "$CONFIG_FILE"
 
-# ── Read IMAGE_NAME from docker-compose.yml ───────────────────────────────────
-if [ -f "docker-compose.yml" ]; then
-  IMAGE_NAME=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 \
-    | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'")
+# ── Read IMAGE_NAME — from config first, then docker-compose.yml ─────────────
+# IMAGE_NAME is now stored in deploy.config.sh (set during setup-deploy).
+# Falls back to docker-compose.yml for backwards compatibility.
+if [ -z "$IMAGE_NAME" ]; then
+  if [ -f "docker-compose.yml" ]; then
+    IMAGE_NAME=$(grep -E '^\s*image\s*:' docker-compose.yml | head -1 \
+      | sed 's/.*image\s*:\s*//' | sed 's/:.*//' | tr -d ' "'"'")
+  fi
 fi
 
 if [ -z "$IMAGE_NAME" ]; then
-  printf "${RED}❌ No 'image:' line found in docker-compose.yml.${NC}\n"
-  printf "   Add one to your service, e.g.: image: myapp\n"
-  printf "   Or run: setup-deploy --fix\n"
+  printf "${RED}❌ IMAGE_NAME not found.${NC}\n"
+  printf "   Fix option 1: Re-run setup-deploy to set image name in deploy.config.sh\n"
+  printf "   Fix option 2: Add 'image: myapp' line to docker-compose.yml\n"
   exit 1
 fi
 
@@ -1019,9 +1023,31 @@ echo "  ── R11: Last 20 log lines ──────────────
 \$DCMD compose logs --tail=20 app 2>&1 | sed 's/^/     /' || true
 echo ""
 
-# ── R12: Prune dangling images (keep :rollback) ───────────────────────────
-echo "  ── R12: Pruning dangling images (keeping :rollback) ─────────────"
+# ── R12: Remove old images — keep only :latest and :rollback ─────────────
+echo "  ── R12: Removing old images (keeping :latest and :rollback) ──────"
+# Get all image IDs for this app
+ALL_IDS=\$(\$DCMD images --format "{{.ID}} {{.Repository}}:{{.Tag}}" \
+  | grep "^.\{0,\} ${IMAGE_NAME}:" \
+  | awk '{print \$1}' || true)
+
+KEEP_LATEST=\$(\$DCMD image inspect --format "{{.Id}}" ${IMAGE_NAME}:latest 2>/dev/null || echo "")
+KEEP_ROLLBACK=\$(\$DCMD image inspect --format "{{.Id}}" ${IMAGE_NAME}:rollback 2>/dev/null || echo "")
+
+REMOVED=0
+for ID in \$ALL_IDS; do
+  FULL_ID=\$(\$DCMD image inspect --format "{{.Id}}" \$ID 2>/dev/null || echo "")
+  if [ "\$FULL_ID" = "\$KEEP_LATEST" ] || [ "\$FULL_ID" = "\$KEEP_ROLLBACK" ]; then
+    continue
+  fi
+  echo "     Removing old image: \$ID"
+  \$DCMD rmi -f \$ID 2>&1 | sed 's/^/     /' || true
+  REMOVED=\$((REMOVED + 1))
+done
+
+# Also prune dangling (untagged) images
 \$DCMD image prune -f 2>&1 | sed 's/^/     /' || true
+
+echo "     ✅ Cleanup done — removed \$REMOVED old image(s)"
 echo ""
 
 # ── R13: Final disk usage ─────────────────────────────────────────────────
