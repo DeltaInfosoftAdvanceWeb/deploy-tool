@@ -553,14 +553,12 @@ do_setup() {
       printf "# Clients (space-separated)\n"
       printf "DEPLOY_CLIENTS=\"%s\"\n\n" "$names_list"
 
-      # Write each client block
+      # Write each client block — extract key=value, store value only
       local j=0
       while [ "$j" -lt "${#CLIENT_NAMES[@]}" ]; do
         local cname="${CLIENT_NAMES[$j]}"
         local cid="${CLIENT_IDS[$j]}"
         local cenv="${CLIENT_ENVS[$j]}"
-        local escaped_env
-        escaped_env=$(printf "%s" "$cenv" | sed "s/'/'\\\\''/g")
 
         printf "# ── Client: %s ──\n" "$cname"
         printf "CLIENT_%s_NAME=\"%s\"\n" "$cname" "$cname"
@@ -569,19 +567,47 @@ do_setup() {
         else
           printf "CLIENT_%s_ID=\"\"\n" "$cname"
         fi
-        printf "CLIENT_%s_ENV='%s'\n\n" "$cname" "$escaped_env"
 
+        # Extract each KEY=VALUE line, strip spaces around =, store as CLIENT_<NAME>_<KEY>="<value>"
+        while IFS= read -r line; do
+          # Skip empty lines and comment lines
+          [ -z "$line" ] && continue
+          echo "$line" | grep -qE '^\s*#' && continue
+          # Must contain = to be a valid env line
+          echo "$line" | grep -qE '=' || continue
+
+          local envkey envval
+          envkey=$(echo "$line" | sed 's/[[:space:]]*=.*//' | tr -d '[:space:]')
+          envval=$(echo "$line" | sed 's/[^=]*=[[:space:]]*//')
+
+          [ -z "$envkey" ] && continue
+
+          printf "CLIENT_%s_%s=\"%s\"\n" "$cname" "$envkey" "$envval"
+        done <<< "$cenv"
+
+        printf "\n"
         j=$((j + 1))
       done
 
     else
-      # Single deployment
+      # Single deployment — extract key=value from pasted block
       printf "# Single deployment (no clients)\n"
       printf "DEPLOY_CLIENTS=\"\"\n\n"
-      local escaped_env
-      escaped_env=$(printf "%s" "${CLIENT_ENVS[0]}" | sed "s/'/'\\\\''/g")
-      printf "# Environment variables\n"
-      printf "PASTED_ENV_VARS='%s'\n" "$escaped_env"
+      local cenv="${CLIENT_ENVS[0]}"
+
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo "$line" | grep -qE '^\s*#' && continue
+        echo "$line" | grep -qE '=' || continue
+
+        local envkey envval
+        envkey=$(echo "$line" | sed 's/[[:space:]]*=.*//' | tr -d '[:space:]')
+        envval=$(echo "$line" | sed 's/[^=]*=[[:space:]]*//')
+
+        [ -z "$envkey" ] && continue
+
+        printf "%s=\"%s\"\n" "$envkey" "$envval"
+      done <<< "$cenv"
     fi
 
   } > deploy.config.sh
